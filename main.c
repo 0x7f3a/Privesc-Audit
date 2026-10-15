@@ -1,0 +1,1944 @@
+/*
+ * privesc-auditor - Linux Privilege Escalation Auditor
+ *
+ * A read-only, defensive enumeration tool that inspects the local system for
+ * common privilege-escalation *misconfigurations* and reports them as findings
+ * for human review. It performs NO exploitation and makes NO changes to the
+ * host. Intended for authorized security audits, hardening, and CTF practice.
+ *
+ * Single-file by design. Organized into logical sections:
+ *   1. Types (enums / structs)
+ *   2. Finding store + reporting helpers
+ *   3. Utility helpers
+ *   4. Scanners (one function per category)
+ *   5. Output (text + JSON)
+ *   6. CLI + main
+ *
+ * See README.md for full documentation, limitations, and caveats.
+ * See fixes.md for the review history behind the fixes in this revision.
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <ctype.h>
+#include <errno.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <limits.h>
+#include <pwd.h>
+#include <grp.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/utsname.h>
+
+#ifdef __linux__
+#include <sys/xattr.h>
+#endif
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+/* ========================================================================
+ * Section 1: Types
+ * ==================================================================== */
+
+#define TOOL_NAME    "privesc-auditor"
+#define TOOL_VERSION "1.1.0"
+
+typedef enum {
+    SEV_INFO = 0,
+    SEV_LOW,
+    SEV_MEDIUM,
+    SEV_HIGH,
+    SEV_CRITICAL,
+    SEV_COUNT
+} Severity;
+
+typedef enum {
+    CONF_POSSIBLE = 0, /* heuristic match, weak signal */
+    CONF_LIKELY,       /* strong signal, plausible path */
+    CONF_CONFIRMED     /* directly observed condition (e.g. writable file) */
+} Confidence;
+
+typedef enum {
+    CAT_SYSTEM = 0,
+    CAT_SUID,
+    CAT_CAPABILITIES,
+    CAT_SUDO,
+    CAT_CRON,
+    CAT_SERVICES,
+    CAT_PROCESSES,
+    CAT_FILESYSTEM,
+    CAT_PACKAGE,
+    CAT_COUNT
+} Category;
+
+typedef struct {
+    Category   category;
+    Severity   severity;
+    Confidence confidence;
+    char       check_id[64];  /* stable identifier, comparable across releases */
+    char       title[128];
+    char       path[1024];
+    char       detail[1024];
+} Finding;
+
+typedef struct {
+    Finding *items;
+    size_t   count;
+    size_t   cap;
+} FindingList;
+
+/* Which scans to run (bitmask over Category) */
+typedef struct {
+    bool verbose;
+    bool json;
+    bool use_color;
+    bool is_root;         /* true if the auditor itself is running as uid 0 */
+    bool sudo_fallback;    /* opt-in: shell out to `sudo -n -l` if sudoers unreadable */
+    unsigned long selected; /* bit per Category; 0 interpreted as "all" */
+} Options;
+
+/* Cached host facts, gathered once. */
+typedef struct {
+    char   user[256];
+    uid_t  uid;
+    gid_t  gid;
+    char   distro[256];
+    char   kernel[256];
+    char   kernel_release[256]; /* raw uname release, for CVE matching */
+    char   arch[128];
+} HostInfo;
+
+/* Coverage/completeness bookkeeping (fixes.md item 2 and item 12). */
+typedef struct {
+    int paths_skipped_unreadable;   /* individual files/dirs skipped mid-walk */
+    int roots_unreadable;           /* a scan root existed but couldn't be read (real failure) */
+    int roots_missing_expected;     /* a scan root simply doesn't exist on this distro (expected) */
+} ScanStats;
+
+/* ========================================================================
+ * Section 2: Finding store + reporting helpers
+ * ==================================================================== */
+
+static const char *severity_name(Severity s) {
+    switch (s) {
+        case SEV_CRITICAL: return "CRITICAL";
+        case SEV_HIGH:     return "HIGH";
+        case SEV_MEDIUM:   return "MEDIUM";
+        case SEV_LOW:      return "LOW";
+        case SEV_INFO:     return "INFO";
+        default:           return "UNKNOWN";
+    }
+}
+
+static const char *severity_color(Severity s) {
+    switch (s) {
+        case SEV_CRITICAL: return "\033[1;35m"; /* bold magenta */
+        case SEV_HIGH:     return "\033[1;31m"; /* bold red */
+        case SEV_MEDIUM:   return "\033[1;33m"; /* bold yellow */
+        case SEV_LOW:      return "\033[1;36m"; /* bold cyan */
+        case SEV_INFO:     return "\033[1;37m"; /* bold white */
+        default:           return "\033[0m";
+    }
+}
+
+static const char *confidence_name(Confidence c) {
+    switch (c) {
+        case CONF_CONFIRMED: return "CONFIRMED";
+        case CONF_LIKELY:    return "LIKELY";
+        case CONF_POSSIBLE:  return "POSSIBLE";
+        default:             return "UNKNOWN";
+    }
+}
+
+static const char *category_name(Category c) {
+    switch (c) {
+        case CAT_SYSTEM:       return "system";
+        case CAT_SUID:         return "suid";
+        case CAT_CAPABILITIES: return "capabilities";
+        case CAT_SUDO:         return "sudo";
+        case CAT_CRON:         return "cron";
+        case CAT_SERVICES:     return "services";
+        case CAT_PROCESSES:    return "processes";
+        case CAT_FILESYSTEM:   return "filesystem";
+        case CAT_PACKAGE:      return "package";
+        default:               return "unknown";
+    }
+}
+
+static void fl_init(FindingList *fl) {
+    fl->items = NULL;
+    fl->count = 0;
+    fl->cap = 0;
+}
+
+static void fl_free(FindingList *fl) {
+    free(fl->items);
+    fl->items = NULL;
+    fl->count = fl->cap = 0;
+}
+
+/* Append a finding. Uses printf-style formatting for the detail string.
+ * check_id is a short, stable, dotted identifier (e.g. "suid.writable_root")
+ * so findings are comparable across tool releases even if title text changes. */
+static void add_finding(FindingList *fl, const char *check_id, Category cat,
+                        Severity sev, Confidence conf, const char *title,
+                        const char *path, const char *detail_fmt, ...) {
+    if (fl->count == fl->cap) {
+        size_t ncap = fl->cap ? fl->cap * 2 : 32;
+        Finding *tmp = realloc(fl->items, ncap * sizeof(*tmp));
+        if (!tmp) {
+            fprintf(stderr, "%s: out of memory\n", TOOL_NAME);
+            return; /* drop the finding rather than crash */
+        }
+        fl->items = tmp;
+        fl->cap = ncap;
+    }
+
+    Finding *f = &fl->items[fl->count++];
+    f->category = cat;
+    f->severity = sev;
+    f->confidence = conf;
+
+    snprintf(f->check_id, sizeof(f->check_id), "%s", check_id ? check_id : "unspecified");
+    snprintf(f->title, sizeof(f->title), "%s", title ? title : "");
+    snprintf(f->path, sizeof(f->path), "%s", path ? path : "");
+
+    if (detail_fmt) {
+        va_list ap;
+        va_start(ap, detail_fmt);
+        vsnprintf(f->detail, sizeof(f->detail), detail_fmt, ap);
+        va_end(ap);
+    } else {
+        f->detail[0] = '\0';
+    }
+}
+
+/* ========================================================================
+ * Section 3: Utility helpers
+ * ==================================================================== */
+
+static bool cat_selected(const Options *o, Category c) {
+    if (o->selected == 0) return true; /* default: all */
+    return (o->selected & (1UL << c)) != 0;
+}
+
+/* True if the current process can write to path (follows symlinks).
+ *
+ * IMPORTANT (fixes.md item 1): when the auditor itself runs as root, this is
+ * true for almost every file on the system - that is root's normal access,
+ * not an unprivileged escalation primitive. Callers must consult
+ * Options.is_root and relabel/downgrade findings accordingly; this helper
+ * only answers the narrow factual question "can the current identity write
+ * this path right now" and makes no claim about what that means. */
+static bool is_writable_by_me(const char *path) {
+    return access(path, W_OK) == 0;
+}
+
+/* True if path is world-writable (others write bit set), per lstat mode.
+ * Unlike is_writable_by_me(), this is identity-independent and remains a
+ * meaningful signal even when the auditor runs as root. */
+static bool mode_world_writable(mode_t m) {
+    return (m & S_IWOTH) != 0;
+}
+
+/* Trim leading/trailing whitespace in place; returns pointer into s. */
+static char *trim(char *s) {
+    while (*s && isspace((unsigned char)*s)) s++;
+    if (!*s) return s;
+    char *end = s + strlen(s) - 1;
+    while (end > s && isspace((unsigned char)*end)) *end-- = '\0';
+    return s;
+}
+
+/* Parse "major.minor.patch" from a kernel release string. */
+static void parse_kernel_version(const char *rel, int *maj, int *min, int *pat) {
+    *maj = *min = *pat = 0;
+    sscanf(rel, "%d.%d.%d", maj, min, pat);
+}
+
+/* Does tok look like a shell env assignment, e.g. "PATH=/x:/y" or "FOO=bar"? */
+static bool looks_like_env_assign(const char *tok) {
+    const char *eq = strchr(tok, '=');
+    if (!eq || eq == tok) return false;
+    if (!isalpha((unsigned char)tok[0]) && tok[0] != '_') return false;
+    for (const char *p = tok; p < eq; p++)
+        if (!isalnum((unsigned char)*p) && *p != '_') return false;
+    return true;
+}
+
+/* ---- Dev/inode "seen" set, for cross-root dedup (fixes.md item 6) ------ */
+
+typedef struct { dev_t dev; ino_t ino; } DevIno;
+typedef struct { DevIno *items; size_t count, cap; } SeenSet;
+
+static void seen_set_init(SeenSet *s) { s->items = NULL; s->count = s->cap = 0; }
+static void seen_set_free(SeenSet *s) { free(s->items); s->items = NULL; s->count = s->cap = 0; }
+
+/* Returns true if (dev,ino) was already present (i.e. this is a duplicate);
+ * otherwise records it and returns false. */
+static bool seen_set_check_add(SeenSet *s, dev_t dev, ino_t ino) {
+    for (size_t i = 0; i < s->count; i++)
+        if (s->items[i].dev == dev && s->items[i].ino == ino) return true;
+    if (s->count == s->cap) {
+        size_t ncap = s->cap ? s->cap * 2 : 64;
+        DevIno *tmp = realloc(s->items, ncap * sizeof(*tmp));
+        if (!tmp) return false; /* best effort: fail open, don't crash */
+        s->items = tmp;
+        s->cap = ncap;
+    }
+    s->items[s->count++] = (DevIno){ dev, ino };
+    return false;
+}
+
+/* ========================================================================
+ * Section 4: Scanners
+ * ==================================================================== */
+
+/* ---- 4.0 Host enumeration --------------------------------------------- */
+
+static void gather_host_info(HostInfo *h) {
+    memset(h, 0, sizeof(*h));
+
+    h->uid = getuid();
+    h->gid = getgid();
+
+    struct passwd *pw = getpwuid(h->uid);
+    snprintf(h->user, sizeof(h->user), "%s", pw ? pw->pw_name : "unknown");
+
+    struct utsname un;
+    if (uname(&un) == 0) {
+        snprintf(h->kernel, sizeof(h->kernel), "%s %s", un.sysname, un.release);
+        snprintf(h->kernel_release, sizeof(h->kernel_release), "%s", un.release);
+        snprintf(h->arch, sizeof(h->arch), "%s", un.machine);
+    } else {
+        snprintf(h->kernel, sizeof(h->kernel), "unknown");
+    }
+
+    /* Distro via /etc/os-release PRETTY_NAME, else fallbacks. */
+    FILE *fp = fopen("/etc/os-release", "r");
+    snprintf(h->distro, sizeof(h->distro), "unknown");
+    if (fp) {
+        char line[512];
+        while (fgets(line, sizeof(line), fp)) {
+            if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
+                char *v = line + 12;
+                v = trim(v);
+                /* strip surrounding quotes */
+                size_t len = strlen(v);
+                if (len >= 2 && v[0] == '"' && v[len - 1] == '"') {
+                    v[len - 1] = '\0';
+                    v++;
+                }
+                snprintf(h->distro, sizeof(h->distro), "%s", v);
+                break;
+            }
+        }
+        fclose(fp);
+    }
+}
+
+static void scan_system(FindingList *fl, const HostInfo *h, const Options *o) {
+    if (h->uid == 0) {
+        add_finding(fl, "sys.running_as_root", CAT_SYSTEM, SEV_INFO, CONF_CONFIRMED,
+                    "Running as root", NULL,
+                    "Audit is running as root (uid 0). Findings that merely say "
+                    "\"writable by the current user\" are downgraded to INFO "
+                    "throughout this report, since root's ability to write files "
+                    "is expected and is not itself an unprivileged escalation path.");
+    }
+    add_finding(fl, "sys.profile", CAT_SYSTEM, SEV_INFO, CONF_CONFIRMED,
+                "System profile", NULL,
+                "user=%s uid=%u gid=%u distro=%s kernel=%s arch=%s",
+                h->user, (unsigned)h->uid, (unsigned)h->gid,
+                h->distro, h->kernel, h->arch);
+    (void)o;
+}
+
+/* ---- 4.1 SUID / SGID scan --------------------------------------------- */
+
+/*
+ * Binaries that are *expected* to be SUID on a normal system. Presence is
+ * reported as INFO. Anything SUID that is also writable, or not on this list,
+ * gets elevated attention.
+ */
+static const char *known_suid[] = {
+    /* /usr/bin and /bin variants are both listed because this tool's
+     * cross-root dedup (fixes.md item 6) reports each binary under whichever
+     * scan root it's discovered through first, which on merged-usr distros
+     * may be the /bin alias rather than the canonical /usr/bin path. */
+    "/usr/bin/sudo", "/bin/sudo",
+    "/usr/bin/su", "/bin/su",
+    "/usr/bin/passwd", "/bin/passwd",
+    "/usr/bin/chsh", "/bin/chsh",
+    "/usr/bin/chfn", "/bin/chfn",
+    "/usr/bin/newgrp", "/bin/newgrp",
+    "/usr/bin/gpasswd", "/bin/gpasswd",
+    "/usr/bin/mount", "/bin/mount",
+    "/usr/bin/umount", "/bin/umount",
+    "/usr/bin/pkexec", "/bin/pkexec",
+    "/usr/lib/dbus-1.0/dbus-daemon-launch-helper",
+    "/usr/bin/fusermount", "/bin/fusermount",
+    "/usr/bin/fusermount3", "/bin/fusermount3",
+    "/usr/lib/openssh/ssh-keysign",
+    "/usr/bin/ping", "/bin/ping",
+    NULL
+};
+
+/*
+ * GTFOBins-style SUID binaries that are well-known escalation primitives when
+ * found SUID. This is a *curated subset* for prioritization only.
+ * (fixes.md item 13: deduped - the stray-leading-space entries below were
+ * exact duplicates of entries already present, since basename_in() also
+ * tolerates stray spaces defensively.)
+ */
+static const char *dangerous_suid[] = {
+    "nmap", "vim", "vi", "nano", "less", "more", "man", "find", "bash",
+    "sh", "dash", "zsh", "python", "python2", "python3", "perl", "ruby",
+    "lua", "php", "awk", "gawk", "nawk", "tee", "cp", "mv", "env", "nice",
+    "tar", "zip", "unzip", "gdb", "tclsh", "expect",
+    "nc", "ncat", "socat", "ftp", "gimp", "node", "make", "cmake",
+    "emacs", "rsync", "scp", "ld.so", "busybox", "docker",
+    "dmesg", "strace", "ltrace", "systemctl", "flock", "ionice",
+    NULL
+};
+
+static bool basename_in(const char *path, const char *const *list) {
+    const char *b = strrchr(path, '/');
+    b = b ? b + 1 : path;
+    for (int i = 0; list[i]; i++) {
+        const char *entry = list[i];
+        while (*entry == ' ') entry++; /* tolerate stray spaces in table */
+        if (strcmp(b, entry) == 0) return true;
+    }
+    return false;
+}
+
+static bool path_in(const char *path, const char *const *list) {
+    for (int i = 0; list[i]; i++)
+        if (strcmp(path, list[i]) == 0) return true;
+    return false;
+}
+
+/*
+ * Recursive directory walk with a bounded depth, invoking cb on each regular
+ * file. Never follows symlinks (avoids loops/redirection surprises) - this is
+ * intentional and documented behavior for suid/capability/service scans.
+ *
+ * fixes.md item 2: records skipped/missing/unreadable paths into *stats
+ * instead of silently dropping them, and distinguishes a root that simply
+ * doesn't exist on this distro (expected) from one that exists but can't be
+ * read (a real scan failure).
+ *
+ * fixes.md item 6: dedups by (device, inode) via *seen so that overlapping
+ * scan roots (e.g. /bin symlinked into /usr/bin on merged-usr distros) don't
+ * produce duplicate findings or duplicate traversal work.
+ */
+static void walk_dir(const char *dir, int depth, int max_depth,
+                     void (*cb)(const char *, const struct stat *, void *),
+                     void *ctx, SeenSet *seen, ScanStats *stats, bool top_level) {
+    if (depth > max_depth) return;
+
+    struct stat dirid;
+    if (stat(dir, &dirid) != 0) {
+        if (top_level) {
+            if (errno == ENOENT) stats->roots_missing_expected++;
+            else stats->roots_unreadable++;
+        } else {
+            stats->paths_skipped_unreadable++;
+        }
+        return;
+    }
+    /* If we've already walked this exact directory via another path (e.g.
+     * /bin -> /usr/bin), skip re-walking and re-reporting it. */
+    if (seen_set_check_add(seen, dirid.st_dev, dirid.st_ino)) return;
+
+    DIR *d = opendir(dir);
+    if (!d) {
+        if (top_level) stats->roots_unreadable++;
+        else stats->paths_skipped_unreadable++;
+        return;
+    }
+
+    struct dirent *de;
+    char child[4096];
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        int n = snprintf(child, sizeof(child), "%s/%s", dir, de->d_name);
+        if (n < 0 || (size_t)n >= sizeof(child)) {
+            stats->paths_skipped_unreadable++;
+            continue;
+        }
+
+        struct stat st;
+        if (lstat(child, &st) != 0) {
+            stats->paths_skipped_unreadable++;
+            continue;
+        }
+
+        if (S_ISLNK(st.st_mode)) continue; /* never follow symlinks */
+
+        if (S_ISDIR(st.st_mode)) {
+            walk_dir(child, depth + 1, max_depth, cb, ctx, seen, stats, false);
+        } else if (S_ISREG(st.st_mode)) {
+            if (seen_set_check_add(seen, st.st_dev, st.st_ino)) continue; /* dup via hardlink/alias */
+            cb(child, &st, ctx);
+        }
+    }
+    closedir(d);
+}
+
+typedef struct { FindingList *fl; const Options *o; } SuidCtx;
+
+static void suid_cb(const char *path, const struct stat *st, void *vctx) {
+    SuidCtx *c = (SuidCtx *)vctx;
+    bool suid = (st->st_mode & S_ISUID) != 0;
+    bool sgid = (st->st_mode & S_ISGID) != 0;
+    if (!suid && !sgid) return;
+
+    bool root_owned = (st->st_uid == 0);
+    bool writable   = is_writable_by_me(path);
+    bool baseline   = path_in(path, known_suid);
+    bool dangerous  = basename_in(path, dangerous_suid);
+    const char *bit = suid && sgid ? "SUID+SGID" : (suid ? "SUID" : "SGID");
+
+    /* --- fixes.md item 1: writable + privileged bit, under a root auditor -- */
+    if (writable && (suid || sgid)) {
+        if (c->o->is_root) {
+            add_finding(c->fl, "suid.writable_root_auditor", CAT_SUID, SEV_INFO,
+                        CONF_CONFIRMED, "Writable privileged binary (root auditor)",
+                        path, "%s binary is writable by root, the identity running "
+                        "this audit. That reflects root's own access, not an "
+                        "unprivileged escalation path.", bit);
+        } else if (root_owned) {
+            add_finding(c->fl, "suid.writable_root_owned", CAT_SUID, SEV_CRITICAL,
+                        CONF_CONFIRMED, "Writable root-owned binary", path,
+                        "%s binary is writable by the current user - direct code "
+                        "execution as owner is likely.", bit);
+        } else {
+            add_finding(c->fl, "suid.writable_nonroot_owned", CAT_SUID, SEV_HIGH,
+                        CONF_CONFIRMED, "Writable non-root-owned privileged binary",
+                        path, "%s binary (owner uid=%u) is writable by the current "
+                        "user - direct code execution as that owner is likely.",
+                        bit, (unsigned)st->st_uid);
+        }
+        return;
+    }
+
+    /* --- SUID handling --- */
+    if (suid && root_owned) {
+        if (dangerous) {
+            add_finding(c->fl, "suid.gtfobins", CAT_SUID, SEV_HIGH, CONF_LIKELY,
+                        "Known-exploitable SUID binary", path,
+                        "%s root-owned binary is a well-known escalation primitive "
+                        "(GTFOBins-style). Verify intent.", bit);
+        } else if (!baseline) {
+            add_finding(c->fl, "suid.nonstandard", CAT_SUID, SEV_MEDIUM, CONF_POSSIBLE,
+                        "Non-standard SUID binary", path,
+                        "%s root-owned binary not on the expected baseline list.", bit);
+        } else {
+            add_finding(c->fl, "suid.baseline", CAT_SUID, SEV_INFO, CONF_CONFIRMED,
+                        "Standard SUID binary", path,
+                        "%s binary (uid=%u), on the expected baseline list.",
+                        bit, (unsigned)st->st_uid);
+        }
+    } else if (suid && !root_owned) {
+        /* fixes.md item 3a: non-root-owned SUID used to fall silently into the
+         * same INFO bucket as baseline binaries. It's unusual and deserves its
+         * own finding - effective privilege is the file owner's, not root's. */
+        add_finding(c->fl, "suid.nonroot_suid", CAT_SUID, SEV_LOW, CONF_POSSIBLE,
+                    "Non-root-owned SUID binary", path,
+                    "SUID bit set but owner is uid=%u, not root. Unusual; verify "
+                    "intent. Effective privilege on execution is the owner's, "
+                    "not root's.", (unsigned)st->st_uid);
+    }
+
+    /* --- fixes.md item 3: SGID as a first-class, separately-flagged case --- */
+    if (sgid) {
+        if (root_owned) {
+            add_finding(c->fl, "suid.sgid_root", CAT_SUID, SEV_MEDIUM, CONF_POSSIBLE,
+                        "Root-owned SGID binary", path,
+                        "SGID bit grants the file's group on execution (group "
+                        "gid=%u). Verify this is expected for this binary.",
+                        (unsigned)st->st_gid);
+        } else {
+            add_finding(c->fl, "suid.sgid_nonroot", CAT_SUID, SEV_LOW, CONF_POSSIBLE,
+                        "Non-root-owned SGID binary", path,
+                        "SGID bit set, group-id=%u, owner uid=%u.",
+                        (unsigned)st->st_gid, (unsigned)st->st_uid);
+        }
+    }
+}
+
+static void scan_suid(FindingList *fl, const Options *o, ScanStats *stats) {
+    static const char *roots[] = {
+        "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin",
+        "/usr/local/sbin", "/usr/lib", "/opt", NULL
+    };
+    SuidCtx ctx = { fl, o };
+    SeenSet seen;
+    seen_set_init(&seen);
+    for (int i = 0; roots[i]; i++)
+        walk_dir(roots[i], 0, 4, suid_cb, &ctx, &seen, stats, true);
+    seen_set_free(&seen);
+}
+
+/* ---- 4.2 Capability scan ---------------------------------------------- */
+
+/*
+ * File capabilities live in the "security.capability" extended attribute on
+ * Linux. We read it directly (no libcap dependency). We decode just enough to
+ * flag dangerous capabilities by their known bit indices.
+ *
+ * fixes.md item 7: cap_sys_chroot and cap_sys_time had the wrong bit numbers
+ * (verified against <linux/capability.h>), cap_sys_ptrace wasn't checked at
+ * all, and cap_sys_module / cap_sys_rawio were missing entirely.
+ */
+#ifdef __linux__
+static const struct { int bit; const char *name; Severity sev; } cap_table[] = {
+    { 0,  "cap_chown",            SEV_MEDIUM   },
+    { 1,  "cap_dac_override",     SEV_HIGH     },
+    { 2,  "cap_dac_read_search",  SEV_HIGH     },
+    { 3,  "cap_fowner",           SEV_MEDIUM   },
+    { 4,  "cap_fsetid",           SEV_MEDIUM   },
+    { 6,  "cap_setgid",           SEV_HIGH     },
+    { 7,  "cap_setuid",           SEV_CRITICAL },
+    { 8,  "cap_setpcap",          SEV_HIGH     },
+    { 12, "cap_net_admin",        SEV_MEDIUM   },
+    { 16, "cap_sys_module",       SEV_CRITICAL }, /* load kernel modules -> instant root */
+    { 17, "cap_sys_rawio",        SEV_HIGH     },
+    { 18, "cap_sys_chroot",       SEV_MEDIUM   }, /* was bit 19 */
+    { 19, "cap_sys_ptrace",       SEV_HIGH     }, /* previously unchecked */
+    { 21, "cap_sys_admin",        SEV_CRITICAL },
+    { 25, "cap_sys_time",         SEV_LOW      }, /* was bit 24 */
+    { -1, NULL,                   SEV_INFO     }
+};
+
+typedef struct { FindingList *fl; } CapCtx;
+
+static void cap_cb(const char *path, const struct stat *st, void *vctx) {
+    (void)st;
+    CapCtx *c = (CapCtx *)vctx;
+    unsigned char buf[64];
+    ssize_t n = getxattr(path, "security.capability", buf, sizeof(buf));
+    if (n <= 0) return;
+
+    /* VFS cap data: magic+flags (4 bytes LE), then permitted/inheritable
+     * dwords per 32-bit block. We OR the permitted words for a bitset. */
+    unsigned long long permitted = 0;
+    if (n >= 12) {
+        permitted |= (unsigned long long)(buf[4] | (buf[5] << 8) |
+                     (buf[6] << 16) | ((unsigned)buf[7] << 24));
+    }
+    if (n >= 20) { /* v2: second 32-bit block of permitted at offset 12 */
+        permitted |= ((unsigned long long)(buf[12] | (buf[13] << 8) |
+                      (buf[14] << 16) | ((unsigned)buf[15] << 24))) << 32;
+    }
+
+    for (int i = 0; cap_table[i].name; i++) {
+        if (permitted & (1ULL << cap_table[i].bit)) {
+            Confidence conf = (cap_table[i].sev >= SEV_HIGH)
+                                  ? CONF_LIKELY : CONF_POSSIBLE;
+            char id[64];
+            snprintf(id, sizeof(id), "cap.%s", cap_table[i].name);
+            add_finding(c->fl, id, CAT_CAPABILITIES, cap_table[i].sev, conf,
+                        "File capability set", path,
+                        "Binary has %s in its permitted set.",
+                        cap_table[i].name);
+        }
+    }
+}
+#endif /* __linux__ */
+
+static void scan_capabilities(FindingList *fl, const Options *o, ScanStats *stats) {
+    (void)o;
+#ifdef __linux__
+    static const char *roots[] = {
+        "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin",
+        "/usr/local/sbin", "/opt", NULL
+    };
+    CapCtx ctx = { fl };
+    SeenSet seen;
+    seen_set_init(&seen);
+    for (int i = 0; roots[i]; i++)
+        walk_dir(roots[i], 0, 4, cap_cb, &ctx, &seen, stats, true);
+    seen_set_free(&seen);
+#else
+    add_finding(fl, "cap.unavailable", CAT_CAPABILITIES, SEV_INFO, CONF_CONFIRMED,
+                "Capability scan unavailable", NULL,
+                "File capabilities are a Linux feature; skipped on this OS.");
+#endif
+}
+
+/* ---- 4.3 Sudo scan ----------------------------------------------------
+ *
+ * fixes.md items 1, 8, 9:
+ *   - /etc/sudoers is normally unreadable to a non-root user; fall back to
+ *     parsing `sudo -n -l` only if the person opts in via --sudo-fallback,
+ *     and always label that fallback explicitly (it shells out, can fail
+ *     silently, and may write to the system sudo log).
+ *   - honor #include / #includedir directives instead of treating them as
+ *     plain comments.
+ *   - skip sudoers.d filenames containing '.' or ending in '~', which real
+ *     sudo/visudo ignore.
+ *   - a writable /etc/sudoers under a root auditor is expected, not a finding.
+ */
+
+#define SUDO_INCLUDE_MAX_DEPTH 8
+
+static bool sudoers_filename_active(const char *name) {
+    if (name[0] == '.') return false;
+    size_t len = strlen(name);
+    if (len == 0) return false;
+    if (name[len - 1] == '~') return false;
+    if (strchr(name, '.') != NULL) return false; /* visudo ignores dotted names */
+    return true;
+}
+
+static void inspect_sudo_line(FindingList *fl, const char *source, const char *s) {
+    if (strstr(s, "NOPASSWD")) {
+        Severity sev = SEV_MEDIUM;
+        if (strstr(s, "ALL") && (strstr(s, "(ALL") || strstr(s, "(root")))
+            sev = SEV_HIGH;
+        add_finding(fl, "sudo.nopasswd", CAT_SUDO, sev, CONF_LIKELY,
+                    "Passwordless sudo rule", source,
+                    "NOPASSWD rule: %.200s", s);
+    }
+    if (strstr(s, "!authenticate")) {
+        add_finding(fl, "sudo.no_authenticate", CAT_SUDO, SEV_MEDIUM, CONF_LIKELY,
+                    "sudo !authenticate", source,
+                    "Rule disables authentication: %.200s", s);
+    }
+    if (strstr(s, "env_keep") &&
+        (strstr(s, "LD_PRELOAD") || strstr(s, "LD_LIBRARY_PATH"))) {
+        add_finding(fl, "sudo.env_keep_loader", CAT_SUDO, SEV_HIGH, CONF_LIKELY,
+                    "Dangerous sudo env_keep", source,
+                    "env_keep preserves loader variable: %.200s", s);
+    }
+}
+
+static void scan_sudo_dir(FindingList *fl, const char *dir, int depth, ScanStats *stats);
+
+static void scan_sudo_file(FindingList *fl, const char *path, int depth, ScanStats *stats) {
+    if (depth > SUDO_INCLUDE_MAX_DEPTH) return;
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        if (errno == ENOENT) stats->roots_missing_expected++;
+        else stats->roots_unreadable++;
+        return;
+    }
+
+    char line[2048];
+    while (fgets(line, sizeof(line), fp)) {
+        char *s = trim(line);
+        if (*s == '\0') continue;
+
+        if (*s == '#') {
+            /* #include / #includedir are directives, not comments. */
+            if (strncmp(s, "#include ", 9) == 0) {
+                char *inc = trim(s + 9);
+                scan_sudo_file(fl, inc, depth + 1, stats);
+            } else if (strncmp(s, "#includedir ", 12) == 0) {
+                char *incdir = trim(s + 12);
+                scan_sudo_dir(fl, incdir, depth + 1, stats);
+            }
+            continue; /* ordinary comment, or directive already handled */
+        }
+
+        inspect_sudo_line(fl, path, s);
+    }
+    fclose(fp);
+}
+
+static void scan_sudo_dir(FindingList *fl, const char *dir, int depth, ScanStats *stats) {
+    if (depth > SUDO_INCLUDE_MAX_DEPTH) return;
+    DIR *d = opendir(dir);
+    if (!d) {
+        if (errno == ENOENT) stats->roots_missing_expected++;
+        else stats->roots_unreadable++;
+        return;
+    }
+    struct dirent *de;
+    char p[4096];
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        if (!sudoers_filename_active(de->d_name)) continue; /* item 9: visudo-ignored names */
+        snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
+        scan_sudo_file(fl, p, depth, stats);
+    }
+    closedir(d);
+}
+
+static void scan_sudo(FindingList *fl, const Options *o, ScanStats *stats) {
+    FILE *probe = fopen("/etc/sudoers", "r");
+    if (probe) {
+        fclose(probe);
+        scan_sudo_file(fl, "/etc/sudoers", 0, stats);
+    } else {
+        int err = errno;
+        add_finding(fl, "sudo.sudoers_unreadable", CAT_SUDO, SEV_INFO, CONF_CONFIRMED,
+                    "/etc/sudoers unreadable", "/etc/sudoers",
+                    "Direct read failed (errno=%d: %s). This is expected for a "
+                    "non-root user.", err, strerror(err));
+        if (o->sudo_fallback) {
+            add_finding(fl, "sudo.fallback_used", CAT_SUDO, SEV_INFO, CONF_CONFIRMED,
+                        "sudo -n -l fallback used", NULL,
+                        "Falling back to 'sudo -n -l' since /etc/sudoers was "
+                        "unreadable. This shells out to sudo, can fail silently "
+                        "without a cached/noninteractive grant, and may write an "
+                        "entry to the system sudo log - it is NOT equivalent to a "
+                        "plain file read, which is why it is opt-in.");
+            FILE *pp = popen("sudo -n -l 2>/dev/null", "r");
+            if (pp) {
+                char line[2048];
+                bool any = false;
+                while (fgets(line, sizeof(line), pp)) {
+                    char *s = trim(line);
+                    if (*s == '\0') continue;
+                    any = true;
+                    inspect_sudo_line(fl, "sudo -n -l", s);
+                }
+                pclose(pp);
+                if (!any)
+                    add_finding(fl, "sudo.fallback_empty", CAT_SUDO, SEV_INFO, CONF_CONFIRMED,
+                                "sudo -n -l returned nothing", NULL,
+                                "No cached/noninteractive sudo authorization, or no "
+                                "rules apply to this user; fallback yielded no data.");
+            } else {
+                add_finding(fl, "sudo.fallback_failed", CAT_SUDO, SEV_LOW, CONF_POSSIBLE,
+                            "sudo -n -l fallback failed to run", NULL,
+                            "Could not execute 'sudo -n -l' as a fallback.");
+            }
+        } else {
+            add_finding(fl, "sudo.fallback_available", CAT_SUDO, SEV_INFO, CONF_CONFIRMED,
+                        "sudo -n -l fallback available but disabled", NULL,
+                        "Re-run with --sudo-fallback to attempt 'sudo -n -l' as a "
+                        "read fallback (opt-in: shells out to sudo, see --help).");
+        }
+    }
+
+    scan_sudo_dir(fl, "/etc/sudoers.d", 0, stats);
+
+    /* Writable sudoers is itself critical - unless we ARE root, in which case
+     * root being able to write its own policy file is not an escalation. */
+    if (is_writable_by_me("/etc/sudoers")) {
+        if (o->is_root) {
+            add_finding(fl, "sudo.sudoers_writable_root_auditor", CAT_SUDO, SEV_INFO,
+                        CONF_CONFIRMED, "/etc/sudoers writable (root auditor)",
+                        "/etc/sudoers", "Writable by root, the identity running "
+                        "this audit; not an unprivileged escalation signal.");
+        } else {
+            add_finding(fl, "sudo.sudoers_writable", CAT_SUDO, SEV_CRITICAL,
+                        CONF_CONFIRMED, "Writable /etc/sudoers", "/etc/sudoers",
+                        "The sudoers policy file is writable by the current user.");
+        }
+    }
+}
+
+/* ---- 4.4 Cron scan ------------------------------------------------------
+ *
+ * fixes.md item 9: parse the schedule/user fields and inspect only the
+ * command portion; distinguish system crontabs (have a user field) from
+ * per-user crontabs (don't); handle `sh -c '...'`, leading env assignments,
+ * common wrappers (sudo/env/nice/...), and quoting well enough to unwrap one
+ * level; mark anything else as unparsed/relative rather than silently
+ * treating every absolute-looking token as "the" executed command.
+ */
+
+static const char *cron_wrappers[] = {
+    "sudo", "env", "nohup", "nice", "ionice", "timeout", "xargs", "setsid", NULL
+};
+
+/* Shell control/test tokens that show up inside cron commands (e.g.
+ * `test -e /x || /y`) but aren't themselves a command to evaluate. Skipping
+ * these (and bare flags) keeps "unparsed token" noise down to things that
+ * actually look like an unresolved command. */
+static bool is_shell_noise_token(const char *tok) {
+    static const char *noise[] = {
+        "test", "[", "]", "&&", "||", ";", "|", "then", "fi", "do", "done", NULL
+    };
+    if (tok[0] == '-') return true; /* flag, e.g. -e, -f, -c */
+    for (int i = 0; noise[i]; i++)
+        if (strcmp(tok, noise[i]) == 0) return true;
+    return false;
+}
+
+/* Inspect a whitespace-tokenized command string (already past schedule/user
+ * fields) for absolute paths worth a writability check. cmd_user may be NULL
+ * (per-user crontab / script context: "runs as the owning user"). */
+static void inspect_token_list(FindingList *fl, const Options *o, const char *file,
+                               const char *cmd_user, char *s) {
+    char *save = NULL;
+    for (char *tok = strtok_r(s, " \t", &save); tok; tok = strtok_r(NULL, " \t", &save)) {
+        if (looks_like_env_assign(tok)) continue;
+
+        bool is_wrapper = false;
+        const char *b = strrchr(tok, '/'); b = b ? b + 1 : tok;
+        for (int i = 0; cron_wrappers[i]; i++) {
+            if (strcmp(b, cron_wrappers[i]) == 0) { is_wrapper = true; break; }
+        }
+        if (is_wrapper) continue; /* keep scanning for the real command token */
+
+        if (strcmp(b, "sh") == 0 || strcmp(b, "bash") == 0 || strcmp(b, "dash") == 0) {
+            /* `sh -c '...'` bodies are unwrapped separately by the caller
+             * (inspect_cron_entry) before tokenizing reaches here; a bare
+             * shell invocation without a parsed -c body is left unparsed. */
+            continue;
+        }
+
+        if (is_shell_noise_token(tok)) continue;
+
+        if (tok[0] != '/') {
+            if (cmd_user)
+                add_finding(fl, "cron.unparsed_token", CAT_CRON, SEV_LOW, CONF_POSSIBLE,
+                            "Relative or unrecognized token in cron job", file,
+                            "Token '%.100s' (job runs as %s) is relative or not a "
+                            "recognized wrapper; not inspected for writability.",
+                            tok, cmd_user);
+            else
+                add_finding(fl, "cron.unparsed_token", CAT_CRON, SEV_LOW, CONF_POSSIBLE,
+                            "Relative or unrecognized token in cron job", file,
+                            "Token '%.100s' is relative or not a recognized "
+                            "wrapper; not inspected for writability.", tok);
+            continue;
+        }
+
+        struct stat st;
+        if (stat(tok, &st) != 0) continue; /* dangling path, not our concern here */
+        if (!S_ISREG(st.st_mode)) continue;
+        if (!is_writable_by_me(tok)) continue;
+
+        if (o->is_root) {
+            add_finding(fl, "cron.writable_ref_root_auditor", CAT_CRON, SEV_INFO,
+                        CONF_CONFIRMED, "Writable cron-referenced file (root auditor)",
+                        tok, "Writable by root, the identity running this audit; "
+                        "not an unprivileged escalation signal.");
+        } else {
+            add_finding(fl, "cron.writable_ref", CAT_CRON, SEV_HIGH, CONF_LIKELY,
+                        "Writable file referenced by cron job", tok,
+                        "Referenced by %s and writable by current user.", file);
+        }
+    }
+}
+
+/* Parse one crontab-format line: "[@keyword | 5 schedule fields] [user] command". */
+static void inspect_cron_entry(FindingList *fl, const Options *o, const char *file,
+                               bool has_user_field, char *line) {
+    char *s = trim(line);
+    if (*s == '\0' || *s == '#') return;
+
+    /* Environment assignment line (PATH=, MAILTO=, SHELL=...) - not a job. */
+    {
+        char probe[2048];
+        snprintf(probe, sizeof(probe), "%s", s);
+        char *psave = NULL;
+        char *first = strtok_r(probe, " \t", &psave);
+        if (first && looks_like_env_assign(first)) return;
+    }
+
+    char copy[2048];
+    snprintf(copy, sizeof(copy), "%s", s);
+    char *save = NULL;
+
+    char *tok = strtok_r(copy, " \t", &save);
+    if (!tok) return;
+
+    if (tok[0] == '@') {
+        /* single schedule token, e.g. @reboot, @daily - nothing more to skip */
+    } else {
+        for (int i = 1; i < 5; i++) {
+            tok = strtok_r(NULL, " \t", &save);
+            if (!tok) {
+                add_finding(fl, "cron.unparsed_line", CAT_CRON, SEV_LOW, CONF_POSSIBLE,
+                            "Unparsed cron line", file,
+                            "Line does not match the expected 5-field/@keyword "
+                            "schedule format; left unparsed: %.150s", s);
+                return;
+            }
+        }
+    }
+
+    char userbuf[256] = "";
+    const char *cmd_user = NULL;
+    if (has_user_field) {
+        tok = strtok_r(NULL, " \t", &save);
+        if (!tok) return;
+        snprintf(userbuf, sizeof(userbuf), "%s", tok);
+        cmd_user = userbuf;
+    }
+
+    char *cmdstart = save; /* strtok_r leaves this at the unconsumed remainder */
+    if (!cmdstart || !*cmdstart) return;
+
+    /* Unwrap one level of `sh -c '...'` / `bash -c "..."`. */
+    char *scpos = strstr(cmdstart, " -c ");
+    if (scpos) {
+        char *q = scpos + 4;
+        while (*q == ' ') q++;
+        if (*q == '\'' || *q == '"') {
+            char quote = *q++;
+            char *end = strchr(q, quote);
+            if (end) {
+                size_t ilen = (size_t)(end - q);
+                char inner[2048];
+                if (ilen >= sizeof(inner)) ilen = sizeof(inner) - 1;
+                memcpy(inner, q, ilen);
+                inner[ilen] = '\0';
+                inspect_token_list(fl, o, file, cmd_user, inner);
+                return;
+            }
+        }
+    }
+
+    char cmdcopy[2048];
+    snprintf(cmdcopy, sizeof(cmdcopy), "%s", cmdstart);
+    inspect_token_list(fl, o, file, cmd_user, cmdcopy);
+}
+
+static void scan_cron_crontab_file(FindingList *fl, const Options *o, const char *path,
+                                   bool has_user_field, ScanStats *stats) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        if (errno == ENOENT) stats->roots_missing_expected++;
+        else stats->roots_unreadable++;
+        return;
+    }
+    char line[2048];
+    while (fgets(line, sizeof(line), fp))
+        inspect_cron_entry(fl, o, path, has_user_field, line);
+    fclose(fp);
+}
+
+/* cron.hourly/daily/weekly/monthly entries are executable scripts, not
+ * crontab-format lines - scan their content for absolute writable refs only,
+ * without trying to parse schedule/user fields that don't exist there. */
+static void inspect_script_for_writable_refs(FindingList *fl, const Options *o, const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+    char line[2048];
+    while (fgets(line, sizeof(line), fp)) {
+        char *s = trim(line);
+        if (*s == '\0' || *s == '#') continue;
+        char copy[2048];
+        snprintf(copy, sizeof(copy), "%s", s);
+        inspect_token_list(fl, o, path, NULL, copy);
+    }
+    fclose(fp);
+}
+
+static void report_writable_cron_path(FindingList *fl, const Options *o,
+                                      const char *title_user, const char *title_root,
+                                      const char *check_id_user, const char *check_id_root,
+                                      const char *path, const char *detail) {
+    if (o->is_root)
+        add_finding(fl, check_id_root, CAT_CRON, SEV_INFO, CONF_CONFIRMED,
+                    title_root, path,
+                    "Writable by root, the identity running this audit; not an "
+                    "unprivileged escalation signal.");
+    else
+        add_finding(fl, check_id_user, CAT_CRON, SEV_HIGH, CONF_CONFIRMED,
+                    title_user, path, "%s", detail);
+}
+
+static void scan_cron(FindingList *fl, const Options *o, ScanStats *stats) {
+    scan_cron_crontab_file(fl, o, "/etc/crontab", /*has_user_field=*/true, stats);
+
+    static const struct { const char *dir; bool has_user_field; bool is_script_dir; } dirs[] = {
+        { "/etc/cron.d",            true,  false },
+        { "/etc/cron.hourly",       false, true  },
+        { "/etc/cron.daily",        false, true  },
+        { "/etc/cron.weekly",       false, true  },
+        { "/etc/cron.monthly",      false, true  },
+        { "/var/spool/cron",        false, false },
+        { "/var/spool/cron/crontabs", false, false },
+        { NULL, false, false }
+    };
+
+    for (int i = 0; dirs[i].dir; i++) {
+        DIR *d = opendir(dirs[i].dir);
+        if (!d) {
+            if (errno == ENOENT) stats->roots_missing_expected++;
+            else stats->roots_unreadable++;
+            continue;
+        }
+
+        if (is_writable_by_me(dirs[i].dir))
+            report_writable_cron_path(fl, o, "Writable cron directory",
+                                      "Writable cron directory (root auditor)",
+                                      "cron.writable_dir", "cron.writable_dir_root_auditor",
+                                      dirs[i].dir, "New scheduled jobs could be added here.");
+
+        struct dirent *de;
+        char p[4096];
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            snprintf(p, sizeof(p), "%s/%s", dirs[i].dir, de->d_name);
+            struct stat st;
+            if (stat(p, &st) != 0) { stats->paths_skipped_unreadable++; continue; }
+            if (!S_ISREG(st.st_mode)) continue;
+
+            if (is_writable_by_me(p))
+                report_writable_cron_path(fl, o, "Writable cron job file",
+                                          "Writable cron job file (root auditor)",
+                                          "cron.writable_file", "cron.writable_file_root_auditor",
+                                          p, "Scheduled job file is writable by current user.");
+
+            if (dirs[i].is_script_dir)
+                inspect_script_for_writable_refs(fl, o, p);
+            else
+                scan_cron_crontab_file(fl, o, p, dirs[i].has_user_field, stats);
+        }
+        closedir(d);
+    }
+}
+
+/* ---- 4.5 Service scan (systemd) -----------------------------------------
+ *
+ * fixes.md item 10:
+ *   - check the unit's parent directory for writability, not just the file.
+ *   - consider User= before calling a writable ExecStart* target a root path.
+ *   - resolve .wants//.requires symlinks whose target falls outside the
+ *     already-scanned roots (most point back into an already-scanned root,
+ *     so only genuinely-external targets are inspected, avoiding duplicate
+ *     findings).
+ *   - coverage of scanned-vs-unreadable unit directories comes for free from
+ *     walk_dir()'s ScanStats threading.
+ */
+
+typedef struct { FindingList *fl; const Options *o; } SvcCtx;
+
+static void svc_cb(const char *path, const struct stat *st, void *vctx) {
+    (void)st;
+    SvcCtx *c = (SvcCtx *)vctx;
+    size_t len = strlen(path);
+    bool is_service = (len >= 8 && strcmp(path + len - 8, ".service") == 0);
+    bool is_timer   = (len >= 6 && strcmp(path + len - 6, ".timer") == 0);
+    if (!is_service && !is_timer) return;
+
+    char parent[4096];
+    snprintf(parent, sizeof(parent), "%s", path);
+    char *slash = strrchr(parent, '/');
+    if (slash) *slash = '\0';
+
+    bool file_writable = is_writable_by_me(path);
+    bool dir_writable   = is_writable_by_me(parent);
+
+    if (file_writable || dir_writable) {
+        if (c->o->is_root) {
+            add_finding(c->fl, "svc.writable_root_auditor", CAT_SERVICES, SEV_INFO,
+                        CONF_CONFIRMED, "Writable unit (root auditor)", path,
+                        "Writable by root, the identity running this audit; not an "
+                        "unprivileged escalation signal.");
+        } else if (file_writable) {
+            add_finding(c->fl, "svc.writable_unit", CAT_SERVICES, SEV_HIGH, CONF_CONFIRMED,
+                        "Writable systemd unit", path,
+                        "Unit file is writable; its ExecStart could be hijacked.");
+        } else {
+            add_finding(c->fl, "svc.writable_unit_dir", CAT_SERVICES, SEV_HIGH, CONF_CONFIRMED,
+                        "Unit in writable directory", path,
+                        "Unit file's directory (%s) is writable by the current "
+                        "user; the unit could be replaced even though the file "
+                        "itself is not directly writable.", parent);
+        }
+        return;
+    }
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+
+    char line[2048];
+    char run_user[256] = "";
+    bool have_user = false;
+    char exec_target[2048] = "";
+    char exec_directive[32] = "";
+    bool have_exec = false;
+
+    while (fgets(line, sizeof(line), fp)) {
+        char *s = trim(line);
+        if (strncmp(s, "User=", 5) == 0) {
+            snprintf(run_user, sizeof(run_user), "%s", trim(s + 5));
+            have_user = (run_user[0] != '\0');
+            continue;
+        }
+        if (strncmp(s, "Exec", 4) == 0) {
+            char *eq = strchr(s, '=');
+            if (!eq) continue;
+            size_t dl = (size_t)(eq - s);
+            char directive[32];
+            if (dl >= sizeof(directive)) dl = sizeof(directive) - 1;
+            memcpy(directive, s, dl);
+            directive[dl] = '\0';
+
+            char *cmd = trim(eq + 1);
+            while (*cmd == '-' || *cmd == '@' || *cmd == '+' || *cmd == '!')
+                cmd++; /* systemd exec prefixes */
+            char *sp = strpbrk(cmd, " \t");
+            if (sp) *sp = '\0';
+            if (cmd[0] == '/') {
+                struct stat bst;
+                if (stat(cmd, &bst) == 0 && S_ISREG(bst.st_mode) && is_writable_by_me(cmd)) {
+                    snprintf(exec_target, sizeof(exec_target), "%s", cmd);
+                    snprintf(exec_directive, sizeof(exec_directive), "%s", directive);
+                    have_exec = true;
+                }
+            }
+        }
+    }
+    fclose(fp);
+
+    if (!have_exec) return;
+
+    bool runs_as_root = !have_user || strcmp(run_user, "root") == 0;
+    if (c->o->is_root) {
+        add_finding(c->fl, "svc.writable_exec_root_auditor", CAT_SERVICES, SEV_INFO,
+                    CONF_CONFIRMED, "Writable service executable (root auditor)",
+                    exec_target, "Writable by root; not an unprivileged escalation signal.");
+    } else if (runs_as_root) {
+        add_finding(c->fl, "svc.writable_exec_root", CAT_SERVICES, SEV_HIGH, CONF_LIKELY,
+                    "Writable service executable (runs as root)", exec_target,
+                    "%s target of %s is writable, and the unit has no non-root "
+                    "User= (or is explicitly User=root).", exec_directive, path);
+    } else {
+        add_finding(c->fl, "svc.writable_exec_nonroot", CAT_SERVICES, SEV_MEDIUM, CONF_LIKELY,
+                    "Writable service executable (non-root unit)", exec_target,
+                    "%s target of %s is writable, but the unit runs as User=%s, "
+                    "not root - escalation would be to that user, not root.",
+                    exec_directive, path, run_user);
+    }
+}
+
+/* Resolve symlinks under unit .wants/.requires directories whose target falls
+ * outside the roots already walked (tracked via *seen); most point back into
+ * an already-scanned root and are correctly left alone to avoid duplicates. */
+static void scan_wants_symlinks(FindingList *fl, const Options *o, const char *dir,
+                                SeenSet *seen, ScanStats *stats, int depth) {
+    if (depth > 6) return; /* unit dirs are shallow; bound defensively */
+    DIR *d = opendir(dir);
+    if (!d) return;
+
+    struct dirent *de;
+    char child[4096];
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        int n = snprintf(child, sizeof(child), "%s/%s", dir, de->d_name);
+        if (n < 0 || (size_t)n >= sizeof(child)) continue;
+
+        struct stat lst;
+        if (lstat(child, &lst) != 0) { stats->paths_skipped_unreadable++; continue; }
+
+        if (S_ISDIR(lst.st_mode)) {
+            scan_wants_symlinks(fl, o, child, seen, stats, depth + 1);
+            continue;
+        }
+        if (!S_ISLNK(lst.st_mode)) continue;
+
+        char raw[4096];
+        ssize_t rn = readlink(child, raw, sizeof(raw) - 1);
+        if (rn <= 0) continue;
+        raw[rn] = '\0';
+
+        char resolved[8192];
+        if (raw[0] == '/') {
+            snprintf(resolved, sizeof(resolved), "%s", raw);
+        } else {
+            char dirbuf[4096];
+            snprintf(dirbuf, sizeof(dirbuf), "%s", child);
+            char *sl = strrchr(dirbuf, '/');
+            if (sl) *sl = '\0';
+            snprintf(resolved, sizeof(resolved), "%s/%s", dirbuf, raw);
+        }
+
+        char canon[PATH_MAX];
+        if (!realpath(resolved, canon)) continue;
+
+        struct stat tst;
+        if (stat(canon, &tst) != 0) continue;
+        if (!S_ISREG(tst.st_mode)) continue;
+
+        /* Already covered by a normally-scanned root -> skip (avoid dup). */
+        if (seen_set_check_add(seen, tst.st_dev, tst.st_ino)) continue;
+
+        SvcCtx ctx = { fl, o };
+        svc_cb(canon, &tst, &ctx);
+    }
+    closedir(d);
+}
+
+static void scan_services(FindingList *fl, const Options *o, ScanStats *stats) {
+    static const char *roots[] = {
+        "/etc/systemd/system", "/lib/systemd/system",
+        "/usr/lib/systemd/system", "/run/systemd/system", NULL
+    };
+    SvcCtx ctx = { fl, o };
+    SeenSet seen;
+    seen_set_init(&seen);
+
+    for (int i = 0; roots[i]; i++)
+        walk_dir(roots[i], 0, 3, svc_cb, &ctx, &seen, stats, true);
+    for (int i = 0; roots[i]; i++)
+        scan_wants_symlinks(fl, o, roots[i], &seen, stats, 0);
+
+    seen_set_free(&seen);
+}
+
+/* ---- 4.6 Process scan ---------------------------------------------------
+ *
+ * fixes.md item 8:
+ *   - state the /proc visibility limitation explicitly.
+ *   - never strip the `(deleted)` readlink suffix and stat() the reconstructed
+ *     path - a different file may now exist there. Use /proc/<pid>/exe
+ *     directly (stat()/access() on it resolve to the original inode even
+ *     after unlink); when the link text contains "(deleted)", report the
+ *     executable as deleted/uninspectable-by-path instead of silently
+ *     dropping or misidentifying it.
+ *   - under a root auditor, every root-owned process looks "writable" - not
+ *     an escalation signal in that case.
+ */
+static void scan_processes(FindingList *fl, const Options *o) {
+    add_finding(fl, "proc.coverage_limitation", CAT_PROCESSES, SEV_INFO, CONF_CONFIRMED,
+                "Process scan coverage limitation", NULL,
+                "/proc/<pid>/exe is only readable for the invoking user's own "
+                "processes, or for all processes if this audit itself runs as "
+                "root. As a non-root user this scan is blind to most other "
+                "users' and root's processes.");
+
+    DIR *d = opendir("/proc");
+    if (!d) {
+        add_finding(fl, "proc.unavailable", CAT_PROCESSES, SEV_INFO, CONF_CONFIRMED,
+                    "Process scan unavailable", NULL,
+                    "/proc not present; process inspection skipped.");
+        return;
+    }
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        bool numeric = de->d_name[0] != '\0';
+        for (const char *p = de->d_name; *p; p++)
+            if (!isdigit((unsigned char)*p)) { numeric = false; break; }
+        if (!numeric) continue;
+
+        char base[320];
+        snprintf(base, sizeof(base), "/proc/%s", de->d_name);
+        struct stat pst;
+        if (stat(base, &pst) != 0) continue; /* not ours/root's, or already gone */
+        if (pst.st_uid != 0) continue;       /* only root-owned processes matter here */
+
+        char exe_path[328];
+        snprintf(exe_path, sizeof(exe_path), "%s/exe", base);
+
+        struct stat est;
+        if (stat(exe_path, &est) != 0) continue; /* unreadable or process gone */
+
+        char target[4096];
+        ssize_t n = readlink(exe_path, target, sizeof(target) - 1);
+        bool deleted = false;
+        if (n > 0) {
+            target[n] = '\0';
+            if (strstr(target, " (deleted)") != NULL) deleted = true;
+        } else {
+            target[0] = '\0';
+        }
+
+        if (deleted) {
+            add_finding(fl, "proc.deleted_exe", CAT_PROCESSES, SEV_LOW, CONF_POSSIBLE,
+                        "Root process with deleted backing executable",
+                        target[0] ? target : exe_path,
+                        "PID %s's on-disk executable has been deleted/replaced "
+                        "since the process started; the original inode is still "
+                        "running but cannot be checked for writability by path.",
+                        de->d_name);
+            continue;
+        }
+
+        /* access()/stat() on /proc/<pid>/exe resolve to the real running
+         * inode even after unlink, so this is safe without reconstructing
+         * any path from the (untrusted-for-this-purpose) readlink text. */
+        if (!is_writable_by_me(exe_path)) continue;
+
+        if (o->is_root) {
+            add_finding(fl, "proc.writable_exe_root_auditor", CAT_PROCESSES, SEV_INFO,
+                        CONF_CONFIRMED, "Root process writable by root (auditor)",
+                        exe_path, "Writable by root, the identity running this "
+                        "audit; not an unprivileged escalation signal.");
+        } else {
+            add_finding(fl, "proc.writable_exe", CAT_PROCESSES, SEV_HIGH, CONF_LIKELY,
+                        "Root process with writable binary", target[0] ? target : exe_path,
+                        "PID %s runs as root from a writable executable.", de->d_name);
+        }
+    }
+    closedir(d);
+}
+
+/* ---- 4.7 Filesystem scan -------------------------------------------------
+ *
+ * fixes.md items 4 and 5:
+ *   - parse $PATH without strtok_r, which silently discards leading,
+ *     trailing, and doubled colons - exactly the empty components (== cwd)
+ *     that matter most.
+ *   - verify a PATH entry is actually a directory before calling it a
+ *     "writable PATH directory".
+ *   - report (rather than silently truncate) an overlong PATH value.
+ */
+static void scan_filesystem(FindingList *fl, const Options *o) {
+    /* 4.7a World-writable directories missing the sticky bit (/tmp-style). */
+    static const char *dirs[] = { "/tmp", "/var/tmp", "/dev/shm", NULL };
+    for (int i = 0; dirs[i]; i++) {
+        struct stat st;
+        if (lstat(dirs[i], &st) != 0) continue;
+        if (mode_world_writable(st.st_mode) && !(st.st_mode & S_ISVTX))
+            add_finding(fl, "fs.sticky_missing", CAT_FILESYSTEM, SEV_MEDIUM, CONF_CONFIRMED,
+                        "World-writable dir without sticky bit", dirs[i],
+                        "Others can delete/replace files in this directory.");
+    }
+
+    /* 4.7b $PATH: writable dirs, relative entries, empty entries. */
+    const char *path_env = getenv("PATH");
+    if (path_env) {
+        char copy[8192];
+        size_t pelen = strlen(path_env);
+        if (pelen >= sizeof(copy)) {
+            add_finding(fl, "fs.path_overlong", CAT_FILESYSTEM, SEV_LOW, CONF_CONFIRMED,
+                        "Overlong $PATH value", NULL,
+                        "$PATH is %zu bytes, exceeding this tool's %zu-byte parse "
+                        "buffer; it was truncated for analysis, so results for "
+                        "$PATH may be incomplete.", pelen, sizeof(copy) - 1);
+        }
+        snprintf(copy, sizeof(copy), "%s", path_env);
+
+        char *p = copy;
+        while (1) {
+            char *colon = strchr(p, ':');
+            if (colon) *colon = '\0';
+            char *entry = p;
+
+            if (entry[0] == '\0') {
+                add_finding(fl, "fs.path_empty_component", CAT_FILESYSTEM, SEV_MEDIUM,
+                            CONF_LIKELY, "Empty $PATH component", NULL,
+                            "An empty PATH entry (leading/trailing/doubled colon) "
+                            "is equivalent to the current directory (.) and can "
+                            "enable binary planting depending on cwd.");
+            } else if (entry[0] != '/') {
+                add_finding(fl, "fs.path_relative", CAT_FILESYSTEM, SEV_MEDIUM, CONF_LIKELY,
+                            "Relative entry in $PATH", entry,
+                            "Non-absolute PATH entry enables binary planting.");
+            } else {
+                struct stat st;
+                if (stat(entry, &st) != 0) {
+                    /* dangling PATH entry - nothing to plant into right now */
+                } else if (!S_ISDIR(st.st_mode)) {
+                    add_finding(fl, "fs.path_not_dir", CAT_FILESYSTEM, SEV_LOW, CONF_CONFIRMED,
+                                "Non-directory $PATH entry", entry,
+                                "PATH entry exists but is not a directory; it "
+                                "cannot supply executables as intended.");
+                } else if (is_writable_by_me(entry)) {
+                    if (o->is_root)
+                        add_finding(fl, "fs.path_writable_root_auditor", CAT_FILESYSTEM,
+                                    SEV_INFO, CONF_CONFIRMED,
+                                    "Writable $PATH directory (root auditor)", entry,
+                                    "Writable by root, the identity running this "
+                                    "audit; not an unprivileged escalation signal.");
+                    else
+                        add_finding(fl, "fs.path_writable", CAT_FILESYSTEM, SEV_HIGH,
+                                    CONF_CONFIRMED, "Writable directory in $PATH", entry,
+                                    "A writable PATH dir allows planting trojan binaries.");
+                }
+            }
+
+            if (!colon) break;
+            p = colon + 1;
+        }
+    }
+
+    /* 4.7c Sensitive files that should never be writable/readable. */
+    static const struct { const char *path; bool check_read; Severity sev; } sens[] = {
+        { "/etc/passwd", false, SEV_CRITICAL },
+        { "/etc/shadow", true,  SEV_CRITICAL },
+        { "/etc/group",  false, SEV_HIGH     },
+        { "/etc/gshadow",true,  SEV_HIGH     },
+        { "/root/.ssh/authorized_keys", false, SEV_HIGH },
+        { NULL, false, SEV_INFO }
+    };
+    for (int i = 0; sens[i].path; i++) {
+        if (is_writable_by_me(sens[i].path)) {
+            if (o->is_root)
+                add_finding(fl, "fs.sensitive_writable_root_auditor", CAT_FILESYSTEM,
+                            SEV_INFO, CONF_CONFIRMED,
+                            "Writable sensitive file (root auditor)", sens[i].path,
+                            "Writable by root, the identity running this audit; "
+                            "not an unprivileged escalation signal.");
+            else
+                add_finding(fl, "fs.sensitive_writable", CAT_FILESYSTEM, sens[i].sev,
+                            CONF_CONFIRMED, "Writable sensitive file", sens[i].path,
+                            "This file is writable by the current user.");
+        } else if (sens[i].check_read && access(sens[i].path, R_OK) == 0) {
+            add_finding(fl, "fs.shadow_readable", CAT_FILESYSTEM, SEV_HIGH, CONF_CONFIRMED,
+                        "Readable shadow file", sens[i].path,
+                        "Password hashes are readable by the current user.");
+        }
+    }
+}
+
+/* ---- 4.8 Package / kernel CVE heuristic -----------------------------------
+ *
+ * fixes.md item 11 (scoped down from a full OVAL/NVD-backed DB):
+ *   - compare full major.minor.patch, not just major.minor.
+ *   - query installed package version via dpkg-query/rpm for package-based
+ *     CVEs (PwnKit) instead of inferring anything from kernel version.
+ *   - always label table matches "candidate, unconfirmed" in the output
+ *     itself - never "matched", since the table can't confirm distro
+ *     applicability or backports on its own.
+ *   - keep "unknown" (couldn't parse kernel version) distinct and never
+ *     collapse it into "not vulnerable".
+ */
+typedef struct {
+    const char *cve;
+    const char *name;
+    int maj_lo, min_lo, pat_lo; /* inclusive lower bound */
+    int maj_hi, min_hi, pat_hi; /* inclusive upper bound */
+    Severity sev;
+} KernelCVE;
+
+static const KernelCVE kernel_cves[] = {
+    { "CVE-2016-5195",  "Dirty COW",           2, 6, 0,   4, 8,  0,  SEV_HIGH },
+    { "CVE-2021-4034",  "PwnKit (pkexec)",     0, 0, 0,   0, 0,  0,  SEV_HIGH }, /* package-based, handled separately */
+    { "CVE-2022-0847",  "Dirty Pipe",          5, 8, 0,   5, 16, 11, SEV_HIGH },
+    { "CVE-2021-22555", "Netfilter heap OOB",  2, 6, 0,   5, 11, 0,  SEV_HIGH },
+    { "CVE-2017-16995", "eBPF verifier",       4, 4, 0,   4, 14, 0,  SEV_HIGH },
+    { "CVE-2021-3493",  "OverlayFS (Ubuntu)",  5, 4, 0,   5, 11, 0,  SEV_HIGH },
+    { NULL, NULL, 0,0,0, 0,0,0, SEV_INFO }
+};
+
+static bool version_in_range(int maj, int min, int pat, const KernelCVE *c) {
+    long v  = (long)maj * 1000000L + (long)min * 1000L + pat;
+    long lo = (long)c->maj_lo * 1000000L + (long)c->min_lo * 1000L + c->pat_lo;
+    long hi = (long)c->maj_hi * 1000000L + (long)c->min_hi * 1000L + c->pat_hi;
+    return v >= lo && v <= hi;
+}
+
+/* Query an installed package version via dpkg or rpm, whichever is present.
+ * Read-only package-manager metadata queries - no privilege required. */
+static bool query_package_version(const char *pkg, char *out, size_t outsz) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "dpkg-query -W -f='${Version}' %s 2>/dev/null", pkg);
+    FILE *pp = popen(cmd, "r");
+    if (pp) {
+        bool ok = (fgets(out, outsz, pp) != NULL) && out[0] != '\0';
+        pclose(pp);
+        if (ok) return true;
+    }
+    snprintf(cmd, sizeof(cmd), "rpm -q --qf '%%{VERSION}-%%{RELEASE}' %s 2>/dev/null", pkg);
+    pp = popen(cmd, "r");
+    if (pp) {
+        bool ok = (fgets(out, outsz, pp) != NULL) && out[0] != '\0' &&
+                  strstr(out, "not installed") == NULL;
+        pclose(pp);
+        if (ok) return true;
+    }
+    out[0] = '\0';
+    return false;
+}
+
+static void scan_package(FindingList *fl, const HostInfo *h, const Options *o) {
+    (void)o;
+    int maj, min, pat;
+    parse_kernel_version(h->kernel_release, &maj, &min, &pat);
+
+    if (maj == 0) {
+        add_finding(fl, "pkg.kernel_version_unknown", CAT_PACKAGE, SEV_INFO, CONF_POSSIBLE,
+                    "Kernel version unknown", NULL,
+                    "Could not parse kernel version '%s' for CVE matching. This "
+                    "is UNKNOWN, not \"not vulnerable\".", h->kernel_release);
+        return;
+    }
+
+    for (int i = 0; kernel_cves[i].cve; i++) {
+        const KernelCVE *c = &kernel_cves[i];
+        if (c->maj_hi == 0 && c->maj_lo == 0) continue; /* package-based entry, not version-ranged */
+        if (version_in_range(maj, min, pat, c)) {
+            add_finding(fl, "pkg.kernel_cve_candidate", CAT_PACKAGE, c->sev, CONF_POSSIBLE,
+                        "Upstream kernel CVE candidate (unconfirmed)", h->kernel_release,
+                        "Kernel %d.%d.%d falls within the historical upstream-"
+                        "affected range for %s (%s). This is an UPSTREAM CANDIDATE "
+                        "ONLY, unconfirmed: distro backports are not accounted "
+                        "for. Verify against your vendor's advisory and installed "
+                        "package/kernel-patch version before treating this as "
+                        "exploitable.", maj, min, pat, c->name, c->cve);
+        }
+    }
+
+    /* pkexec/PwnKit: presence + SUID is the signal; applicability depends on
+     * the installed polkit package version, not the kernel version. */
+    struct stat st;
+    if (stat("/usr/bin/pkexec", &st) == 0 && (st.st_mode & S_ISUID)) {
+        char ver[128];
+        if (query_package_version("policykit-1", ver, sizeof(ver)) ||
+            query_package_version("polkit", ver, sizeof(ver))) {
+            add_finding(fl, "pkg.pwnkit_surface", CAT_PACKAGE, SEV_MEDIUM, CONF_POSSIBLE,
+                        "pkexec present (PwnKit surface)", "/usr/bin/pkexec",
+                        "SUID pkexec present; installed polkit package version is "
+                        "%s. CVE-2021-4034 applicability depends on this package "
+                        "version, not kernel version - verify against the vendor "
+                        "advisory.", trim(ver));
+        } else {
+            add_finding(fl, "pkg.pwnkit_surface_unknown_version", CAT_PACKAGE, SEV_MEDIUM,
+                        CONF_POSSIBLE, "pkexec present (PwnKit surface)", "/usr/bin/pkexec",
+                        "SUID pkexec present but the installed polkit package "
+                        "version could not be determined (no dpkg/rpm, or the "
+                        "query failed). Verify manually against vendor advisories "
+                        "for CVE-2021-4034.");
+        }
+    }
+}
+
+/* ========================================================================
+ * Section 5: Output
+ * ==================================================================== */
+
+static void count_by_severity(const FindingList *fl, const Options *o, int counts[SEV_COUNT]) {
+    for (int i = 0; i < SEV_COUNT; i++) counts[i] = 0;
+    for (size_t i = 0; i < fl->count; i++) {
+        if (!o->verbose && fl->items[i].severity == SEV_INFO) continue;
+        counts[fl->items[i].severity]++;
+    }
+}
+
+/* Sort findings by severity (desc) for readable output. Simple insertion sort. */
+static void sort_findings(FindingList *fl) {
+    for (size_t i = 1; i < fl->count; i++) {
+        Finding key = fl->items[i];
+        size_t j = i;
+        while (j > 0 && fl->items[j - 1].severity < key.severity) {
+            fl->items[j] = fl->items[j - 1];
+            j--;
+        }
+        fl->items[j] = key;
+    }
+}
+
+static void print_banner(const HostInfo *h) {
+    printf("========================================\n");
+    printf(" Linux Privilege Escalation Auditor\n");
+    printf("========================================\n\n");
+    printf("User:   %s\n", h->user);
+    printf("UID:    %u\n", (unsigned)h->uid);
+    printf("Distro: %s\n", h->distro);
+    printf("Kernel: %s\n", h->kernel);
+    printf("\n");
+}
+
+/* fixes.md item 2 / 12: coverage line, shown in both text and JSON output so
+ * a partial scan never looks identical to a clean one. */
+static void print_coverage_text(const ScanStats *stats) {
+    bool partial = (stats->roots_unreadable > 0) || (stats->paths_skipped_unreadable > 0);
+    printf("Scan coverage: %s\n", partial ? "PARTIAL" : "complete");
+    printf("  Paths skipped (unreadable mid-walk): %d\n", stats->paths_skipped_unreadable);
+    printf("  Scan roots unreadable (real failure): %d\n", stats->roots_unreadable);
+    printf("  Scan roots absent on this distro (expected): %d\n", stats->roots_missing_expected);
+    printf("\n");
+}
+
+static void report_text(const FindingList *fl, const Options *o, const ScanStats *stats,
+                        const char *const *ran, int nran) {
+    int counts[SEV_COUNT];
+    count_by_severity(fl, o, counts);
+
+    for (int i = 0; i < nran; i++)
+        printf("[+] %s\n", ran[i]);
+    printf("\n");
+
+    print_coverage_text(stats);
+
+    printf("Findings: %zu\n", fl->count);
+    printf("Critical: %d\n", counts[SEV_CRITICAL]);
+    printf("High:     %d\n", counts[SEV_HIGH]);
+    printf("Medium:   %d\n", counts[SEV_MEDIUM]);
+    printf("Low:      %d\n", counts[SEV_LOW]);
+    printf("Info:     %d\n", counts[SEV_INFO]);
+    printf("\n");
+
+    printf("Potential privilege-escalation paths:\n\n");
+
+    const char *reset = o->use_color ? "\033[0m" : "";
+    for (size_t i = 0; i < fl->count; i++) {
+        const Finding *f = &fl->items[i];
+        /* In non-verbose mode, suppress INFO-level noise - same rule the
+         * JSON output now applies (fixes.md item 12). */
+        if (!o->verbose && f->severity == SEV_INFO) continue;
+
+        const char *col = o->use_color ? severity_color(f->severity) : "";
+        printf("%s[%s]%s %s\n", col, severity_name(f->severity), reset, f->title);
+        printf("  Check:      %s\n", f->check_id);
+        printf("  Category:   %s\n", category_name(f->category));
+        printf("  Confidence: %s\n", confidence_name(f->confidence));
+        if (f->path[0])
+            printf("  Path:       %s\n", f->path);
+        if (f->detail[0])
+            printf("  Detail:     %s\n", f->detail);
+        printf("\n");
+    }
+
+    if (fl->count == 0 ||
+        (!o->verbose && counts[SEV_CRITICAL] + counts[SEV_HIGH] +
+                            counts[SEV_MEDIUM] + counts[SEV_LOW] == 0)) {
+        printf("No actionable findings at the selected verbosity.\n");
+        if (!o->verbose)
+            printf("(Re-run with --verbose to include INFO findings.)\n");
+        printf("\n");
+    }
+
+    printf("NOTE: Findings are audit results requiring human verification, "
+           "not proof of exploitability. A nonzero exit code means findings "
+           "were reported - it does not mean exploitation was attempted or "
+           "confirmed.\n");
+}
+
+/* Minimal JSON string escaper - escapes control characters so output stays
+ * valid even for unusual path/system strings (fixes.md item 12). */
+static void json_escape(FILE *out, const char *s) {
+    for (; *s; s++) {
+        switch (*s) {
+            case '"':  fputs("\\\"", out); break;
+            case '\\': fputs("\\\\", out); break;
+            case '\n': fputs("\\n", out);  break;
+            case '\r': fputs("\\r", out);  break;
+            case '\t': fputs("\\t", out);  break;
+            default:
+                if ((unsigned char)*s < 0x20 || (unsigned char)*s == 0x7f)
+                    fprintf(out, "\\u%04x", (unsigned char)*s);
+                else
+                    fputc(*s, out);
+        }
+    }
+}
+
+static void report_json(const FindingList *fl, const Options *o, const HostInfo *h,
+                        const ScanStats *stats) {
+    int counts[SEV_COUNT];
+    count_by_severity(fl, o, counts);
+    bool partial = (stats->roots_unreadable > 0) || (stats->paths_skipped_unreadable > 0);
+
+    printf("{\n");
+    printf("  \"tool\": \"%s\",\n", TOOL_NAME);
+    printf("  \"version\": \"%s\",\n", TOOL_VERSION);
+    printf("  \"host\": {\n");
+    printf("    \"user\": \""); json_escape(stdout, h->user); printf("\",\n");
+    printf("    \"uid\": %u,\n", (unsigned)h->uid);
+    printf("    \"distro\": \""); json_escape(stdout, h->distro); printf("\",\n");
+    printf("    \"kernel\": \""); json_escape(stdout, h->kernel); printf("\",\n");
+    printf("    \"arch\": \""); json_escape(stdout, h->arch); printf("\"\n");
+    printf("  },\n");
+    printf("  \"coverage\": {\n");
+    printf("    \"partial\": %s,\n", partial ? "true" : "false");
+    printf("    \"paths_skipped_unreadable\": %d,\n", stats->paths_skipped_unreadable);
+    printf("    \"roots_unreadable\": %d,\n", stats->roots_unreadable);
+    printf("    \"roots_missing_expected\": %d\n", stats->roots_missing_expected);
+    printf("  },\n");
+    printf("  \"summary\": {\n");
+    printf("    \"total\": %zu,\n", fl->count);
+    printf("    \"critical\": %d,\n", counts[SEV_CRITICAL]);
+    printf("    \"high\": %d,\n", counts[SEV_HIGH]);
+    printf("    \"medium\": %d,\n", counts[SEV_MEDIUM]);
+    printf("    \"low\": %d,\n", counts[SEV_LOW]);
+    printf("    \"info\": %d\n", counts[SEV_INFO]);
+    printf("  },\n");
+    printf("  \"findings\": [\n");
+
+    /* fixes.md item 12: --verbose/INFO filtering must behave the same in
+     * JSON as in text, so count visible items up front for correct commas. */
+    size_t visible = 0;
+    for (size_t i = 0; i < fl->count; i++)
+        if (o->verbose || fl->items[i].severity != SEV_INFO) visible++;
+
+    size_t emitted = 0;
+    for (size_t i = 0; i < fl->count; i++) {
+        const Finding *f = &fl->items[i];
+        if (!o->verbose && f->severity == SEV_INFO) continue;
+        emitted++;
+        printf("    {\n");
+        printf("      \"check_id\": \""); json_escape(stdout, f->check_id); printf("\",\n");
+        printf("      \"severity\": \"%s\",\n", severity_name(f->severity));
+        printf("      \"confidence\": \"%s\",\n", confidence_name(f->confidence));
+        printf("      \"category\": \"%s\",\n", category_name(f->category));
+        printf("      \"title\": \""); json_escape(stdout, f->title); printf("\",\n");
+        printf("      \"path\": \""); json_escape(stdout, f->path); printf("\",\n");
+        printf("      \"detail\": \""); json_escape(stdout, f->detail); printf("\"\n");
+        printf("    }%s\n", (emitted < visible) ? "," : "");
+    }
+    printf("  ]\n");
+    printf("}\n");
+}
+
+/* ========================================================================
+ * Section 6: CLI + main
+ * ==================================================================== */
+
+static void usage(FILE *out) {
+    fprintf(out,
+"%s %s - Linux Privilege Escalation Auditor (read-only)\n"
+"\n"
+"USAGE:\n"
+"  %s [options]\n"
+"\n"
+"OPTIONS:\n"
+"  --help              Show this help and exit\n"
+"  --version           Show version and exit\n"
+"  --verbose           Include INFO-level findings in output (text and JSON)\n"
+"  --json              Emit machine-readable JSON instead of text\n"
+"  --no-color          Disable ANSI colors in text output\n"
+"  --check <category>  Run only one category (repeatable)\n"
+"  --sudo-fallback      If /etc/sudoers can't be read directly, fall back to\n"
+"                       parsing `sudo -n -l` output. Opt-in: this shells out\n"
+"                       to sudo, can fail silently without a cached/non-\n"
+"                       interactive grant, and may write to the sudo log.\n"
+"\n"
+"CATEGORIES:\n"
+"  system        Host / user / kernel enumeration\n"
+"  suid          SUID / SGID binary scan\n"
+"  capabilities  File capability scan (Linux only)\n"
+"  sudo          sudoers policy review\n"
+"  cron          Scheduled-task review\n"
+"  services      systemd unit review\n"
+"  processes     Root processes with writable binaries (Linux only)\n"
+"  filesystem    Writable PATH dirs / sensitive files / sticky bits\n"
+"  package       Kernel-version CVE heuristic (coarse) + package-based checks\n"
+"\n"
+"This tool only reads system state. Findings require human verification\n"
+"and are NOT proof of exploitability. A nonzero exit code means findings\n"
+"were reported, not that exploitation was attempted or confirmed.\n",
+        TOOL_NAME, TOOL_VERSION, TOOL_NAME);
+}
+
+static int category_from_name(const char *name, Category *out) {
+    for (int c = 0; c < CAT_COUNT; c++) {
+        if (strcmp(name, category_name((Category)c)) == 0) {
+            *out = (Category)c;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int main(int argc, char **argv) {
+    Options o;
+    o.verbose = false;
+    o.json = false;
+    o.use_color = isatty(STDOUT_FILENO) ? true : false;
+    o.is_root = false;
+    o.sudo_fallback = false;
+    o.selected = 0;
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
+            usage(stdout);
+            return 0;
+        } else if (strcmp(a, "--version") == 0) {
+            printf("%s %s\n", TOOL_NAME, TOOL_VERSION);
+            return 0;
+        } else if (strcmp(a, "--verbose") == 0 || strcmp(a, "-v") == 0) {
+            o.verbose = true;
+        } else if (strcmp(a, "--json") == 0) {
+            o.json = true;
+        } else if (strcmp(a, "--no-color") == 0) {
+            o.use_color = false;
+        } else if (strcmp(a, "--sudo-fallback") == 0) {
+            o.sudo_fallback = true;
+        } else if (strcmp(a, "--check") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: --check requires a category\n", TOOL_NAME);
+                return 2;
+            }
+            Category c;
+            if (category_from_name(argv[++i], &c) != 0) {
+                fprintf(stderr, "%s: unknown category '%s'\n", TOOL_NAME, argv[i]);
+                return 2;
+            }
+            o.selected |= (1UL << c);
+        } else {
+            fprintf(stderr, "%s: unknown option '%s' (try --help)\n", TOOL_NAME, a);
+            return 2;
+        }
+    }
+
+    HostInfo host;
+    gather_host_info(&host);
+    o.is_root = (host.uid == 0);
+
+    FindingList fl;
+    fl_init(&fl);
+
+    ScanStats stats;
+    memset(&stats, 0, sizeof(stats));
+
+    /* Track which scans actually ran, for the "[+] ..." banner. */
+    const char *ran[CAT_COUNT];
+    int nran = 0;
+
+    if (cat_selected(&o, CAT_SYSTEM)) {
+        scan_system(&fl, &host, &o);
+        ran[nran++] = "System enumeration";
+    }
+    if (cat_selected(&o, CAT_SUID)) {
+        scan_suid(&fl, &o, &stats);
+        ran[nran++] = "SUID/SGID scan";
+    }
+    if (cat_selected(&o, CAT_CAPABILITIES)) {
+        scan_capabilities(&fl, &o, &stats);
+        ran[nran++] = "Capability scan";
+    }
+    if (cat_selected(&o, CAT_SUDO)) {
+        scan_sudo(&fl, &o, &stats);
+        ran[nran++] = "Sudo scan";
+    }
+    if (cat_selected(&o, CAT_CRON)) {
+        scan_cron(&fl, &o, &stats);
+        ran[nran++] = "Cron scan";
+    }
+    if (cat_selected(&o, CAT_SERVICES)) {
+        scan_services(&fl, &o, &stats);
+        ran[nran++] = "Service scan";
+    }
+    if (cat_selected(&o, CAT_PROCESSES)) {
+        scan_processes(&fl, &o);
+        ran[nran++] = "Process scan";
+    }
+    if (cat_selected(&o, CAT_FILESYSTEM)) {
+        scan_filesystem(&fl, &o);
+        ran[nran++] = "Filesystem scan";
+    }
+    if (cat_selected(&o, CAT_PACKAGE)) {
+        scan_package(&fl, &host, &o);
+        ran[nran++] = "Package/CVE scan";
+    }
+
+    sort_findings(&fl);
+
+    if (o.json) {
+        report_json(&fl, &o, &host, &stats);
+    } else {
+        print_banner(&host);
+        report_text(&fl, &o, &stats, ran, nran);
+    }
+
+    /* Exit code reflects worst severity found (useful in CI / scripts):
+     *   0 = nothing notable, 1 = low/medium, 2 = high, 3 = critical.
+     * This does NOT mean exploitation was attempted or confirmed - see
+     * --help / README for the full exit-code contract. */
+    int counts[SEV_COUNT];
+    count_by_severity(&fl, &o, counts);
+    int rc = 0;
+    if (counts[SEV_CRITICAL]) rc = 3;
+    else if (counts[SEV_HIGH]) rc = 2;
+    else if (counts[SEV_MEDIUM] || counts[SEV_LOW]) rc = 1;
+
+    fl_free(&fl);
+    return rc;
+}

@@ -19,6 +19,18 @@
  */
 
 #define _GNU_SOURCE
+
+#ifdef _WIN32
+/* The Windows port is a plain Win32 API build (no POSIX layer): services,
+ * registry, token privileges and ACL-based permission checks. */
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#include <windows.h>
+#include <io.h>
+#include <aclapi.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,15 +39,18 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <errno.h>
-#include <dirent.h>
-#include <unistd.h>
 #include <limits.h>
-#include <pwd.h>
-#include <grp.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#ifndef _WIN32
+#include <dirent.h>
+#include <unistd.h>
+#include <pwd.h>
+#include <grp.h>
 #include <sys/utsname.h>
+#endif
 
 #ifdef __linux__
 #include <sys/xattr.h>
@@ -45,12 +60,24 @@
 #define PATH_MAX 4096
 #endif
 
+/* MSVC spells the reentrant tokenizer strtok_s; same signature and semantics
+ * as strtok_r, which glibc/mingw provide. */
+#if defined(_MSC_VER) && !defined(strtok_r)
+#define strtok_r strtok_s
+#endif
+
 /* ========================================================================
  * Section 1: Types
  * ==================================================================== */
 
 #define TOOL_NAME    "privesc-auditor"
-#define TOOL_VERSION "1.2.0"
+#define TOOL_VERSION "2.0.0"  /* 2.0: Windows port */
+
+#ifdef _WIN32
+#define TOOL_PLATFORM "windows"
+#else
+#define TOOL_PLATFORM "linux"
+#endif
 
 typedef enum {
     SEV_INFO = 0,
@@ -77,6 +104,8 @@ typedef enum {
     CAT_PROCESSES,
     CAT_FILESYSTEM,
     CAT_PACKAGE,
+    CAT_AUTOSTART,   /* Windows: Run/RunOnce, Startup folders, AlwaysInstallElevated */
+    CAT_PRIVILEGES,  /* Windows: dangerous token privileges */
     CAT_COUNT
 } Category;
 
@@ -101,16 +130,26 @@ typedef struct {
     bool verbose;
     bool json;
     bool use_color;
-    bool is_root;         /* true if the auditor itself is running as uid 0 */
+    bool is_root;         /* privileged auditor: uid 0 on POSIX, elevated admin
+                           * on Windows. Findings caused only by that elevated
+                           * access are downgraded to INFO. */
     bool sudo_fallback;    /* opt-in: shell out to `sudo -n -l` if sudoers unreadable */
     unsigned long selected; /* bit per Category; 0 interpreted as "all" */
 } Options;
 
+#ifdef _WIN32
+typedef unsigned audit_id_t; /* Windows has no uid/gid; kept for the shared struct */
+#else
+typedef uid_t audit_id_t;
+#endif
+
 /* Cached host facts, gathered once. */
 typedef struct {
     char   user[256];
-    uid_t  uid;
-    gid_t  gid;
+    audit_id_t uid;             /* POSIX only; 0 on Windows (not applicable) */
+    audit_id_t gid;
+    char   platform[16];        /* "linux" or "windows" */
+    bool   elevated;            /* Windows: token is an elevated administrator */
     char   distro[256];
     char   kernel[256];
     char   kernel_release[256]; /* raw uname release, for CVE matching */
@@ -170,6 +209,8 @@ static const char *category_name(Category c) {
         case CAT_PROCESSES:    return "processes";
         case CAT_FILESYSTEM:   return "filesystem";
         case CAT_PACKAGE:      return "package";
+        case CAT_AUTOSTART:    return "autostart";
+        case CAT_PRIVILEGES:   return "privileges";
         default:               return "unknown";
     }
 }
@@ -254,16 +295,337 @@ static bool cat_selected(const Options *o, Category c) {
  * Options.is_root and relabel/downgrade findings accordingly; this helper
  * only answers the narrow factual question "can the current identity write
  * this path right now" and makes no claim about what that means. */
+#ifndef _WIN32
 static bool is_writable_by_me(const char *path) {
     return access(path, W_OK) == 0;
 }
+#endif
 
-/* True if path is world-writable (others write bit set), per lstat mode.
- * Unlike is_writable_by_me(), this is identity-independent and remains a
- * meaningful signal even when the auditor runs as root. */
-static bool mode_world_writable(mode_t m) {
-    return (m & S_IWOTH) != 0;
+/* ---- Windows command-line/path helpers --------------------------------
+ *
+ * Pure string logic (no Win32 calls), so these also build and are unit-tested
+ * on POSIX. They model what the Service Control Manager / CreateProcess will
+ * actually launch, which is where unquoted-service-path hijacks come from. */
+
+/* Case-insensitive substring search; returns a pointer to the first match. */
+static inline const char *str_ci_str(const char *hay, const char *needle) {
+    if (!needle[0]) return hay;
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (needle[i] && p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i]))
+            i++;
+        if (!needle[i]) return p;
+    }
+    return NULL;
 }
+
+static inline bool win_path_is_quoted(const char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    return *s == '"';
+}
+
+/* The image path the loader tries first: the text inside the first pair of
+ * quotes, or everything up to the first space when unquoted. */
+static inline bool win_exec_token(const char *cmd, char *out, size_t outsz) {
+    if (outsz < 2) return false;
+    out[0] = '\0';
+    while (*cmd == ' ' || *cmd == '\t') cmd++;
+
+    size_t n = 0;
+    if (*cmd == '"') {
+        cmd++;
+        while (*cmd && *cmd != '"') {
+            if (n + 1 < outsz) out[n++] = *cmd;
+            cmd++;
+        }
+    } else {
+        while (*cmd && *cmd != ' ' && *cmd != '\t') {
+            if (n + 1 < outsz) out[n++] = *cmd;
+            cmd++;
+        }
+    }
+    out[n] = '\0';
+    return n > 0;
+}
+
+/* An unquoted image path is ambiguous when ".exe" only appears after the first
+ * space (e.g. `C:\Program Files\App\svc.exe`). `C:\Windows\system32\svchost.exe
+ * -k netsvcs` has its extension before the first space and is unambiguous. */
+static inline bool win_unquoted_ambiguous(const char *cmd) {
+    if (win_path_is_quoted(cmd)) return false;
+    const char *sp = strpbrk(cmd, " \t");
+    if (!sp) return false;
+    const char *exe = str_ci_str(cmd, ".exe");
+    return exe != NULL && exe > sp;
+}
+
+/* The idx-th file CreateProcess would try for an unquoted command line: the
+ * text up to the idx-th space plus ".exe". Returns false when exhausted. */
+static inline bool win_unquoted_candidate(const char *cmd, int idx,
+                                          char *exe_out, size_t exesz) {
+    exe_out[0] = '\0';
+    int seen = 0;
+    for (const char *p = cmd; *p; p++) {
+        if (*p != ' ' && *p != '\t') continue;
+        size_t len = (size_t)(p - cmd);
+        while (len > 0 && (cmd[len - 1] == ' ' || cmd[len - 1] == '\t')) len--;
+        if (len == 0 || len + 5 > exesz) continue;
+        if (seen++ != idx) continue;
+
+        memcpy(exe_out, cmd, len);
+        exe_out[len] = '\0';
+        if (!(len >= 4 && str_ci_str(exe_out + len - 4, ".exe") == exe_out + len - 4))
+            memcpy(exe_out + len, ".exe", 5); /* includes the terminator */
+        return true;
+    }
+    return false;
+}
+
+/* Directory portion, including the trailing separator: "C:\a\b.exe" ->
+ * "C:\a\"; the drive root behaves the same way ("C:\Program.exe" -> "C:\"). */
+static inline bool win_dirname(const char *path, char *out, size_t outsz) {
+    const char *last = NULL;
+    for (const char *p = path; *p; p++)
+        if (*p == '\\' || *p == '/') last = p;
+    if (!outsz) return false;
+    if (!last) { out[0] = '\0'; return false; }
+    size_t len = (size_t)(last - path) + 1;
+    if (len >= outsz) len = outsz - 1;
+    memcpy(out, path, len);
+    out[len] = '\0';
+    return true;
+}
+
+static inline bool str_eq_ci(const char *a, const char *b) {
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/* Drive-absolute (C:\... or C:/...) or UNC (\\server\share). */
+static inline bool win_is_abs_path(const char *p) {
+    if (!p || !*p) return false;
+    if (p[0] == '\\' && p[1] == '\\') return true;
+    return isalpha((unsigned char)p[0]) && p[1] == ':' &&
+           (p[2] == '\\' || p[2] == '/');
+}
+
+#ifdef _WIN32
+/* ---- Windows API helpers ---------------------------------------------- */
+
+/* UTF-8 (report/JSON) <-> UTF-16 (Win32). Caller frees the result. */
+static wchar_t *win_wide(const char *utf8) {
+    if (!utf8) return NULL;
+    int need = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (need <= 0) return NULL;
+    wchar_t *w = malloc((size_t)need * sizeof(*w));
+    if (!w) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, need) <= 0) {
+        free(w);
+        return NULL;
+    }
+    return w;
+}
+
+static char *win_utf8(const wchar_t *w) {
+    if (!w) return NULL;
+    int need = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (need <= 0) return NULL;
+    char *s = malloc((size_t)need);
+    if (!s) return NULL;
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, s, need, NULL, NULL) <= 0) {
+        free(s);
+        return NULL;
+    }
+    return s;
+}
+
+/* Ask the token whether the object's DACL grants `access`. Never opens the
+ * object, so the audit cannot modify or lock anything. */
+static bool win_access_check(PSECURITY_DESCRIPTOR sd, DWORD access,
+                             GENERIC_MAPPING *map) {
+    HANDLE tok = NULL;
+    bool granted_all = false;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+
+    PRIVILEGE_SET privs;
+    DWORD privsz = sizeof(privs);
+    DWORD granted = 0;
+    BOOL ok = FALSE;
+    if (AccessCheck(sd, tok, access, map, &privs, &privsz, &granted, &ok) && ok)
+        granted_all = true;
+
+    CloseHandle(tok);
+    return granted_all;
+}
+
+/* Effective write access to a file or directory. */
+static bool is_writable_by_me(const char *path) {
+    wchar_t *wpath = win_wide(path);
+    if (!wpath) return false;
+
+    bool writable = false;
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    if (GetNamedSecurityInfoW(wpath, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                              NULL, NULL, &dacl, NULL, &sd) == ERROR_SUCCESS) {
+        if (!dacl) {
+            writable = true; /* NULL DACL means everyone has full control */
+        } else {
+            GENERIC_MAPPING map;
+            map.GenericRead = FILE_GENERIC_READ;
+            map.GenericWrite = FILE_GENERIC_WRITE;
+            map.GenericExecute = FILE_GENERIC_EXECUTE;
+            map.GenericAll = FILE_ALL_ACCESS;
+            writable = win_access_check(sd, FILE_GENERIC_WRITE, &map);
+        }
+        LocalFree(sd);
+    }
+    free(wpath);
+    return writable;
+}
+
+/* Effective KEY_SET_VALUE access to a registry key (root is HKLM or HKCU). */
+static bool win_reg_write_allowed(HKEY root, const char *subkey) {
+    const char *provider = (root == HKEY_LOCAL_MACHINE) ? "MACHINE" : "CURRENT_USER";
+    wchar_t wprovider[32];
+    if (MultiByteToWideChar(CP_UTF8, 0, provider, -1, wprovider, 32) <= 0) return false;
+    wchar_t *wsub = win_wide(subkey);
+    if (!wsub) return false;
+
+    wchar_t full[1024];
+    swprintf(full, sizeof(full) / sizeof(full[0]), L"%s\\%s", wprovider, wsub);
+    free(wsub);
+
+    bool writable = false;
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    if (GetNamedSecurityInfoW(full, SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION,
+                              NULL, NULL, &dacl, NULL, &sd) == ERROR_SUCCESS) {
+        if (!dacl) {
+            writable = true;
+        } else {
+            GENERIC_MAPPING map;
+            map.GenericRead = KEY_READ;
+            map.GenericWrite = KEY_WRITE;
+            map.GenericExecute = KEY_EXECUTE;
+            map.GenericAll = KEY_ALL_ACCESS;
+            writable = win_access_check(sd, KEY_SET_VALUE, &map);
+        }
+        LocalFree(sd);
+    }
+    return writable;
+}
+
+static bool win_process_elevated(void) {
+    HANDLE tok = NULL;
+    bool elevated = false;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        TOKEN_ELEVATION te;
+        DWORD sz = 0;
+        if (GetTokenInformation(tok, TokenElevation, &te, sizeof(te), &sz))
+            elevated = te.TokenIsElevated != 0;
+        CloseHandle(tok);
+    }
+    return elevated;
+}
+
+/* Read a REG_SZ/REG_EXPAND_SZ value as UTF-8. False if absent or not a string. */
+static bool win_reg_read_string(HKEY root, const char *subkey, const char *value,
+                                char *out, size_t outsz) {
+    if (outsz) out[0] = '\0';
+    wchar_t *wsub = win_wide(subkey);
+    wchar_t *wval = win_wide(value);
+    if (!wsub || !wval) { free(wsub); free(wval); return false; }
+
+    bool ok = false;
+    HKEY key;
+    if (RegOpenKeyExW(root, wsub, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        DWORD type = 0, bytes = 0;
+        if (RegQueryValueExW(key, wval, NULL, &type, NULL, &bytes) == ERROR_SUCCESS &&
+            (type == REG_SZ || type == REG_EXPAND_SZ) &&
+            bytes >= sizeof(wchar_t) && bytes <= 8192) {
+            wchar_t *buf = malloc(bytes + sizeof(wchar_t));
+            if (buf) {
+                if (RegQueryValueExW(key, wval, NULL, &type, (BYTE *)buf, &bytes) == ERROR_SUCCESS) {
+                    buf[bytes / sizeof(wchar_t) - 1] = L'\0';
+                    char *u = win_utf8(buf);
+                    if (u) {
+                        snprintf(out, outsz, "%s", u);
+                        free(u);
+                        ok = true;
+                    }
+                }
+                free(buf);
+            }
+        }
+        RegCloseKey(key);
+    }
+    free(wsub);
+    free(wval);
+    return ok;
+}
+
+static bool win_reg_read_dword(HKEY root, const char *subkey, const char *value,
+                               DWORD *out) {
+    wchar_t *wsub = win_wide(subkey);
+    wchar_t *wval = win_wide(value);
+    if (!wsub || !wval) { free(wsub); free(wval); return false; }
+
+    bool ok = false;
+    HKEY key;
+    if (RegOpenKeyExW(root, wsub, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        DWORD type = 0, data = 0, bytes = sizeof(data);
+        if (RegQueryValueExW(key, wval, NULL, &type, (BYTE *)&data, &bytes) == ERROR_SUCCESS &&
+            type == REG_DWORD) {
+            *out = data;
+            ok = true;
+        }
+        RegCloseKey(key);
+    }
+    free(wsub);
+    free(wval);
+    return ok;
+}
+
+static void win_arch_string(char *out, size_t outsz) {
+    SYSTEM_INFO si;
+    GetNativeSystemInfo(&si);
+    const char *a = "unknown";
+    switch (si.wProcessorArchitecture) {
+        case PROCESSOR_ARCHITECTURE_AMD64: a = "x86_64"; break;
+        case PROCESSOR_ARCHITECTURE_ARM64: a = "arm64";  break;
+        case PROCESSOR_ARCHITECTURE_INTEL: a = "x86";    break;
+        case PROCESSOR_ARCHITECTURE_ARM:   a = "arm";    break;
+        default: break;
+    }
+    snprintf(out, outsz, "%s", a);
+}
+
+/* Expand %SystemRoot% and friends so paths can be tested as-is. */
+static void win_expand_env(const char *in, char *out, size_t outsz) {
+    wchar_t *win = win_wide(in);
+    if (!win) {
+        snprintf(out, outsz, "%s", in);
+        return;
+    }
+    wchar_t wout[2048];
+    DWORD n = ExpandEnvironmentStringsW(win, wout,
+                                        (DWORD)(sizeof(wout) / sizeof(wout[0])));
+    if (n > 0 && n <= sizeof(wout) / sizeof(wout[0])) {
+        char *u = win_utf8(wout);
+        snprintf(out, outsz, "%s", u ? u : in);
+        free(u);
+    } else {
+        snprintf(out, outsz, "%s", in);
+    }
+    free(win);
+}
+#endif /* _WIN32 */
 
 /* Trim leading/trailing whitespace in place; returns pointer into s. */
 static char *trim(char *s) {
@@ -272,6 +634,14 @@ static char *trim(char *s) {
     char *end = s + strlen(s) - 1;
     while (end > s && isspace((unsigned char)*end)) *end-- = '\0';
     return s;
+}
+
+#ifndef _WIN32
+/* True if path is world-writable (others write bit set), per lstat mode.
+ * Unlike is_writable_by_me(), this is identity-independent and remains a
+ * meaningful signal even when the auditor runs as root. */
+static bool mode_world_writable(mode_t m) {
+    return (m & S_IWOTH) != 0;
 }
 
 /* Parse "major.minor.patch" from a kernel release string. */
@@ -381,6 +751,7 @@ static bool seen_set_check_add(SeenSet *s, dev_t dev, ino_t ino) {
         i = (i + 1) & (s->cap - 1);
     }
 }
+#endif /* !_WIN32 */
 
 /* ========================================================================
  * Section 4: Scanners
@@ -390,7 +761,64 @@ static bool seen_set_check_add(SeenSet *s, dev_t dev, ino_t ino) {
 
 static void gather_host_info(HostInfo *h) {
     memset(h, 0, sizeof(*h));
+    snprintf(h->platform, sizeof(h->platform), "%s", TOOL_PLATFORM);
 
+#ifdef _WIN32
+    wchar_t wuser[256];
+    DWORD uname_len = (DWORD)(sizeof(wuser) / sizeof(wuser[0]));
+    if (GetUserNameW(wuser, &uname_len)) {
+        char *u = win_utf8(wuser);
+        snprintf(h->user, sizeof(h->user), "%s", u ? u : "unknown");
+        free(u);
+    } else {
+        snprintf(h->user, sizeof(h->user), "unknown");
+    }
+
+    h->elevated = win_process_elevated();
+
+    /* GetVersionEx is manifest-lied on 8.1+, so ask ntdll for the real build. */
+    typedef struct {
+        ULONG size, major, minor, build, platform;
+        WCHAR csd[128];
+    } audit_osver;
+    typedef LONG (WINAPI *rtl_get_version_fn)(audit_osver *);
+
+    audit_osver ver;
+    memset(&ver, 0, sizeof(ver));
+    ver.size = sizeof(ver);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    rtl_get_version_fn rtl = ntdll
+        ? (rtl_get_version_fn)(void *)GetProcAddress(ntdll, "RtlGetVersion") : NULL;
+
+    if (rtl && rtl(&ver) == 0) {
+        snprintf(h->kernel, sizeof(h->kernel), "Windows NT %lu.%lu.%lu",
+                 (unsigned long)ver.major, (unsigned long)ver.minor,
+                 (unsigned long)ver.build);
+        snprintf(h->kernel_release, sizeof(h->kernel_release), "%lu",
+                 (unsigned long)ver.build);
+    } else {
+        snprintf(h->kernel, sizeof(h->kernel), "Windows NT (version unknown)");
+        snprintf(h->kernel_release, sizeof(h->kernel_release), "0");
+    }
+
+    char product[128] = "", display[64] = "";
+    DWORD ubr = 0;
+    win_reg_read_string(HKEY_LOCAL_MACHINE,
+                        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+                        "ProductName", product, sizeof(product));
+    win_reg_read_string(HKEY_LOCAL_MACHINE,
+                        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+                        "DisplayVersion", display, sizeof(display));
+    win_reg_read_dword(HKEY_LOCAL_MACHINE,
+                       "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+                       "UBR", &ubr);
+    snprintf(h->distro, sizeof(h->distro), "%s%s%s (build %s.%lu)",
+             product[0] ? product : "Windows", display[0] ? " " : "", display,
+             h->kernel_release, (unsigned long)ubr);
+
+    win_arch_string(h->arch, sizeof(h->arch));
+    return;
+#else
     h->uid = getuid();
     h->gid = getgid();
 
@@ -427,9 +855,26 @@ static void gather_host_info(HostInfo *h) {
         }
         fclose(fp);
     }
+#endif /* _WIN32 */
 }
 
 static void scan_system(FindingList *fl, const HostInfo *h, const Options *o) {
+#ifdef _WIN32
+    if (h->elevated) {
+        add_finding(fl, "sys.running_elevated", CAT_SYSTEM, SEV_INFO, CONF_CONFIRMED,
+                    "Running elevated", NULL,
+                    "The audit is running with an elevated administrator token. "
+                    "Findings that only say \"writable by the current user\" are "
+                    "downgraded to INFO, because an elevated administrator can "
+                    "write almost everything and that is not itself an "
+                    "unprivileged escalation path.");
+    }
+    add_finding(fl, "sys.profile", CAT_SYSTEM, SEV_INFO, CONF_CONFIRMED,
+                "System profile", NULL,
+                "user=%s os=%s kernel=%s arch=%s elevated=%s",
+                h->user, h->distro, h->kernel, h->arch,
+                h->elevated ? "yes" : "no");
+#else
     if (h->uid == 0) {
         add_finding(fl, "sys.running_as_root", CAT_SYSTEM, SEV_INFO, CONF_CONFIRMED,
                     "Running as root", NULL,
@@ -443,8 +888,11 @@ static void scan_system(FindingList *fl, const HostInfo *h, const Options *o) {
                 "user=%s uid=%u gid=%u distro=%s kernel=%s arch=%s",
                 h->user, (unsigned)h->uid, (unsigned)h->gid,
                 h->distro, h->kernel, h->arch);
+#endif
     (void)o;
 }
+
+#ifndef _WIN32
 
 /* ---- 4.1 SUID / SGID scan --------------------------------------------- */
 
@@ -1914,6 +2362,587 @@ static void scan_package(FindingList *fl, const HostInfo *h, const Options *o) {
     }
 }
 
+#else /* _WIN32 */
+
+/* ---- 4W. Windows scanners ---------------------------------------------
+ *
+ * Same finding model, categories, severities and JSON as the POSIX build, with
+ * Windows escalation primitives in place of SUID/sudo/cron:
+ *   services    unquoted image paths, writable service images/directories
+ *   autostart   HKLM Run/RunOnce, Startup folders, AlwaysInstallElevated
+ *   filesystem  writable directories in %PATH%
+ *   privileges  dangerous token privileges, integrity level
+ *
+ * Every check is read-only: permissions are tested with AccessCheck against
+ * the object's DACL, never by opening the target for writing. As on POSIX,
+ * findings caused only by the auditor's own elevated token are downgraded to
+ * INFO (Options.is_root is set for an elevated administrator).
+ */
+
+#ifndef SECURITY_MANDATORY_MEDIUM_RID
+#define SECURITY_MANDATORY_MEDIUM_RID 0x2000
+#endif
+#ifndef SECURITY_MANDATORY_HIGH_RID
+#define SECURITY_MANDATORY_HIGH_RID 0x3000
+#endif
+#ifndef SECURITY_MANDATORY_SYSTEM_RID
+#define SECURITY_MANDATORY_SYSTEM_RID 0x4000
+#endif
+
+static const char *win_error_text(DWORD err) {
+    static char buf[256];
+    DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                             NULL, err, 0, buf, (DWORD)sizeof(buf), NULL);
+    if (!n) {
+        snprintf(buf, sizeof(buf), "error %lu", (unsigned long)err);
+        return buf;
+    }
+    return trim(buf);
+}
+
+static bool win_account_is_privileged(const char *account) {
+    if (!account || !*account) return true; /* LocalSystem */
+    return str_eq_ci(account, "LocalSystem") ||
+           str_eq_ci(account, "SYSTEM") ||
+           str_eq_ci(account, "NT AUTHORITY\\SYSTEM") ||
+           str_eq_ci(account, "NT AUTHORITY\\LocalService") ||
+           str_eq_ci(account, "NT AUTHORITY\\NetworkService") ||
+           str_eq_ci(account, "LocalService") ||
+           str_eq_ci(account, "NetworkService");
+}
+
+/* Inspect one service's configuration. */
+static void win_inspect_service(FindingList *fl, const Options *o, SC_HANDLE scm,
+                                const wchar_t *name) {
+    SC_HANDLE svc = OpenServiceW(scm, name, SERVICE_QUERY_CONFIG);
+    if (!svc) return; /* no permission, or the service disappeared */
+
+    DWORD needed = 0;
+    QueryServiceConfigW(svc, NULL, 0, &needed);
+    if (needed == 0) {
+        CloseServiceHandle(svc);
+        return;
+    }
+
+    QUERY_SERVICE_CONFIGW *cfg = malloc(needed);
+    if (!cfg) {
+        CloseServiceHandle(svc);
+        return;
+    }
+    if (!QueryServiceConfigW(svc, cfg, needed, &needed)) {
+        free(cfg);
+        CloseServiceHandle(svc);
+        return;
+    }
+
+    char *svc_name = win_utf8(name);
+    char *raw = win_utf8(cfg->lpBinaryPathName ? cfg->lpBinaryPathName : L"");
+    char *acct = win_utf8(cfg->lpServiceStartName ? cfg->lpServiceStartName : L"");
+
+    if (!raw || !raw[0]) {
+        free(svc_name); free(raw); free(acct); free(cfg);
+        CloseServiceHandle(svc);
+        return;
+    }
+
+    char cmd[2048];
+    win_expand_env(raw, cmd, sizeof(cmd));
+
+    char image[1024];
+    bool have_image = win_exec_token(cmd, image, sizeof(image));
+    bool privileged = win_account_is_privileged(acct);
+    const char *acct_label = (acct && *acct) ? acct : "LocalSystem";
+    const char *shown = have_image ? image : cmd;
+
+    /* 1. Unquoted image path whose extension appears only after a space. */
+    if (win_unquoted_ambiguous(cmd)) {
+        bool hijackable = false;
+        char cand[1024], dir[1024];
+        for (int i = 0; win_unquoted_candidate(cmd, i, cand, sizeof(cand)); i++) {
+            /* The last candidate is the service's own image; its directory is
+             * covered by the writable-directory check below. */
+            if (str_eq_ci(cand, image)) continue;
+            if (!win_dirname(cand, dir, sizeof(dir))) continue;
+            if (!is_writable_by_me(dir)) continue;
+            hijackable = true;
+
+            if (o->is_root) {
+                add_finding(fl, "svc.unquoted_path_root_auditor", CAT_SERVICES, SEV_INFO,
+                            CONF_CONFIRMED,
+                            "Writable directory on unquoted service path (elevated auditor)",
+                            dir, "Directory is writable by the identity running this "
+                            "audit; not an unprivileged escalation signal.");
+            } else {
+                add_finding(fl, "svc.unquoted_path_writable", CAT_SERVICES, SEV_HIGH,
+                            CONF_CONFIRMED,
+                            "Unquoted service path with writable directory", dir,
+                            "Service '%s' (runs as %s) has an unquoted image path. "
+                            "The loader would also try '%s', which the current user "
+                            "could create.",
+                            svc_name ? svc_name : "?", acct_label, cand);
+            }
+            break;
+        }
+
+        if (!hijackable) {
+            add_finding(fl, "svc.unquoted_path", CAT_SERVICES,
+                        o->is_root ? SEV_INFO : SEV_MEDIUM, CONF_POSSIBLE,
+                        "Unquoted service path", shown,
+                        "Service '%s' has an unquoted image path containing spaces. "
+                        "No candidate directory is writable by the current user, but "
+                        "another account could still plant an executable.",
+                        svc_name ? svc_name : "?");
+        }
+    }
+
+    /* 2. Writable image, else writable image directory. */
+    if (have_image && is_writable_by_me(image)) {
+        if (o->is_root) {
+            add_finding(fl, "svc.writable_image_root_auditor", CAT_SERVICES, SEV_INFO,
+                        CONF_CONFIRMED, "Writable service image (elevated auditor)", image,
+                        "Writable by the identity running this audit; not an "
+                        "unprivileged escalation signal.");
+        } else {
+            add_finding(fl, "svc.writable_image", CAT_SERVICES,
+                        privileged ? SEV_CRITICAL : SEV_HIGH, CONF_CONFIRMED,
+                        privileged ? "Writable service image (privileged account)"
+                                   : "Writable service image (non-privileged account)",
+                        image,
+                        "Service '%s' runs as %s from an image writable by the "
+                        "current user - replacing it executes code as that account.",
+                        svc_name ? svc_name : "?", acct_label);
+        }
+    } else if (have_image) {
+        char dir[1024];
+        if (win_dirname(image, dir, sizeof(dir)) && is_writable_by_me(dir)) {
+            if (o->is_root) {
+                add_finding(fl, "svc.writable_dir_root_auditor", CAT_SERVICES, SEV_INFO,
+                            CONF_CONFIRMED,
+                            "Writable service directory (elevated auditor)", dir,
+                            "Writable by the identity running this audit; not an "
+                            "unprivileged escalation signal.");
+            } else {
+                add_finding(fl, "svc.writable_dir", CAT_SERVICES,
+                            privileged ? SEV_HIGH : SEV_MEDIUM, CONF_LIKELY,
+                            "Service in writable directory", dir,
+                            "The directory holding service '%s' (runs as %s) is "
+                            "writable, so its image could be replaced.",
+                            svc_name ? svc_name : "?", acct_label);
+            }
+        }
+    }
+
+    free(svc_name);
+    free(raw);
+    free(acct);
+    free(cfg);
+    CloseServiceHandle(svc);
+}
+
+static void scan_services(FindingList *fl, const Options *o, ScanStats *stats) {
+    SC_HANDLE scm = OpenSCManagerW(NULL, NULL,
+                                   SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+    if (!scm) {
+        stats->roots_unreadable++;
+        add_finding(fl, "svc.unavailable", CAT_SERVICES, SEV_INFO, CONF_CONFIRMED,
+                    "Service scan unavailable", NULL,
+                    "OpenSCManager failed (%s); service findings are incomplete.",
+                    win_error_text(GetLastError()));
+        return;
+    }
+
+    DWORD bytes = 256 * 1024;
+    BYTE *buf = malloc(bytes);
+    if (!buf) {
+        CloseServiceHandle(scm);
+        return;
+    }
+
+    int inspected = 0;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        DWORD resume = 0;
+        bool need_more = false;
+        inspected = 0;
+
+        for (;;) {
+            DWORD needed = 0, returned = 0;
+            if (!EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32,
+                                       SERVICE_STATE_ALL, buf, bytes, &needed,
+                                       &returned, &resume, NULL)) {
+                if (GetLastError() == ERROR_MORE_DATA) need_more = true;
+                break;
+            }
+
+            ENUM_SERVICE_STATUS_PROCESSW *list = (ENUM_SERVICE_STATUS_PROCESSW *)buf;
+            for (DWORD i = 0; i < returned; i++) {
+                win_inspect_service(fl, o, scm, list[i].lpServiceName);
+                inspected++;
+            }
+            if (resume == 0) break;
+        }
+
+        if (!need_more) break;
+
+        /* `resume` points into the old buffer, so growing it means starting
+         * over; add_finding() collapses any duplicate findings. */
+        DWORD bigger = bytes * 2;
+        BYTE *nb = realloc(buf, bigger);
+        if (!nb) break;
+        buf = nb;
+        bytes = bigger;
+    }
+
+    add_finding(fl, "svc.enumerated", CAT_SERVICES, SEV_INFO, CONF_CONFIRMED,
+                "Services enumerated", NULL, "%d services inspected.", inspected);
+
+    free(buf);
+    CloseServiceHandle(scm);
+}
+
+/* ---- 4W.2 Autostart ---------------------------------------------------- */
+
+static void win_scan_run_key(FindingList *fl, const Options *o, HKEY root,
+                             const char *subkey, const char *label) {
+    wchar_t *wsub = win_wide(subkey);
+    if (!wsub) return;
+
+    HKEY key;
+    if (RegOpenKeyExW(root, wsub, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        free(wsub);
+        return;
+    }
+    free(wsub);
+
+    bool machine_wide = (root == HKEY_LOCAL_MACHINE);
+    if (machine_wide && win_reg_write_allowed(root, subkey)) {
+        if (o->is_root) {
+            add_finding(fl, "auto.run_key_writable_root_auditor", CAT_AUTOSTART, SEV_INFO,
+                        CONF_CONFIRMED, "Writable autostart key (elevated auditor)", label,
+                        "Writable by the identity running this audit; not an "
+                        "unprivileged escalation signal.");
+        } else {
+            add_finding(fl, "auto.run_key_writable", CAT_AUTOSTART, SEV_CRITICAL,
+                        CONF_CONFIRMED, "Writable machine-wide autostart key", label,
+                        "%s is writable by the current user; a new value runs code "
+                        "for every user who logs on.", label);
+        }
+    }
+
+    for (DWORD idx = 0;; idx++) {
+        wchar_t vname[512];
+        DWORD vname_len = (DWORD)(sizeof(vname) / sizeof(vname[0]));
+        BYTE data[4096];
+        DWORD data_len = sizeof(data);
+        DWORD type = 0;
+
+        LONG rc = RegEnumValueW(key, idx, vname, &vname_len, NULL, &type, data, &data_len);
+        if (rc == ERROR_NO_MORE_ITEMS) break;
+        if (rc == ERROR_MORE_DATA) continue; /* value too big for this buffer */
+        if (rc != ERROR_SUCCESS) break;
+        if ((type != REG_SZ && type != REG_EXPAND_SZ) || data_len < sizeof(wchar_t))
+            continue;
+
+        wchar_t *wval = (wchar_t *)data;
+        wval[data_len / sizeof(wchar_t) - 1] = L'\0';
+        char *cmd = win_utf8(wval);
+        if (!cmd || !*cmd) {
+            free(cmd);
+            continue;
+        }
+
+        char expanded[2048], image[1024];
+        win_expand_env(cmd, expanded, sizeof(expanded));
+        if (win_exec_token(expanded, image, sizeof(image)) && is_writable_by_me(image)) {
+            if (o->is_root) {
+                add_finding(fl, "auto.run_target_writable_root_auditor", CAT_AUTOSTART,
+                            SEV_INFO, CONF_CONFIRMED,
+                            "Writable autostart target (elevated auditor)", image,
+                            "Writable by the identity running this audit; not an "
+                            "unprivileged escalation signal.");
+            } else {
+                add_finding(fl, "auto.run_target_writable", CAT_AUTOSTART, SEV_HIGH,
+                            CONF_LIKELY, "Writable autostart target", image,
+                            "%s launches this image, which is writable by the "
+                            "current user.", label);
+            }
+        }
+        free(cmd);
+    }
+    RegCloseKey(key);
+}
+
+static void win_scan_startup_folder(FindingList *fl, const Options *o,
+                                    const char *env_var, const char *suffix,
+                                    bool all_users) {
+    const char *base = getenv(env_var);
+    if (!base || !*base) return;
+
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s\\%s", base, suffix);
+    if (!win_is_abs_path(dir) || !is_writable_by_me(dir)) return;
+
+    if (o->is_root) {
+        add_finding(fl, "auto.startup_dir_root_auditor", CAT_AUTOSTART, SEV_INFO,
+                    CONF_CONFIRMED, "Writable Startup folder (elevated auditor)", dir,
+                    "Writable by the identity running this audit; not an unprivileged "
+                    "escalation signal.");
+    } else if (all_users) {
+        add_finding(fl, "auto.startup_dir_writable", CAT_AUTOSTART, SEV_HIGH,
+                    CONF_CONFIRMED, "Writable all-users Startup folder", dir,
+                    "Anything placed here is executed for every user who logs on.");
+    } else {
+        add_finding(fl, "auto.startup_dir_user_writable", CAT_AUTOSTART, SEV_LOW,
+                    CONF_CONFIRMED, "Writable per-user Startup folder", dir,
+                    "This is the current user's own Startup folder; it runs whatever "
+                    "is placed in it for this account only.");
+    }
+
+    if (!all_users) return;
+
+    char pattern[1100];
+    snprintf(pattern, sizeof(pattern), "%s\\*", dir);
+    wchar_t *wpat = win_wide(pattern);
+    if (!wpat) return;
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpat, &fd);
+    free(wpat);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char *name = win_utf8(fd.cFileName);
+        if (!name) continue;
+
+        char file[2048];
+        snprintf(file, sizeof(file), "%s\\%s", dir, name);
+        free(name);
+
+        if (!is_writable_by_me(file)) continue;
+
+        if (o->is_root) {
+            add_finding(fl, "auto.startup_file_root_auditor", CAT_AUTOSTART, SEV_INFO,
+                        CONF_CONFIRMED, "Writable Startup entry (elevated auditor)",
+                        file, "Writable by the identity running this audit; not an "
+                        "unprivileged escalation signal.");
+        } else {
+            add_finding(fl, "auto.startup_file_writable", CAT_AUTOSTART, SEV_HIGH,
+                        CONF_CONFIRMED, "Writable all-users Startup entry", file,
+                        "This autostart entry can be replaced by the current user and "
+                        "runs for every account that logs on.");
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static void scan_autostart(FindingList *fl, const Options *o) {
+    static const struct { const char *subkey; const char *label; } run_keys[] = {
+        { "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM Run" },
+        { "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce", "HKLM RunOnce" },
+        { "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run",
+          "HKLM Run (32-bit view)" },
+        { "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+          "HKLM RunOnce (32-bit view)" },
+        { NULL, NULL }
+    };
+    for (int i = 0; run_keys[i].subkey; i++)
+        win_scan_run_key(fl, o, HKEY_LOCAL_MACHINE, run_keys[i].subkey, run_keys[i].label);
+
+    win_scan_startup_folder(fl, o, "ProgramData",
+                            "Microsoft\\Windows\\Start Menu\\Programs\\StartUp", true);
+    win_scan_startup_folder(fl, o, "APPDATA",
+                            "Microsoft\\Windows\\Start Menu\\Programs\\StartUp", false);
+
+    /* AlwaysInstallElevated only elevates when both policies are enabled. */
+    DWORD machine = 0, user_all = 0;
+    bool m = win_reg_read_dword(HKEY_LOCAL_MACHINE,
+                                "SOFTWARE\\Policies\\Microsoft\\Windows\\Installer",
+                                "AlwaysInstallElevated", &machine) && machine == 1;
+    bool u = win_reg_read_dword(HKEY_CURRENT_USER,
+                                "SOFTWARE\\Policies\\Microsoft\\Windows\\Installer",
+                                "AlwaysInstallElevated", &user_all) && user_all == 1;
+
+    if (m && u) {
+        add_finding(fl, "auto.always_install_elevated", CAT_AUTOSTART,
+                    o->is_root ? SEV_INFO : SEV_CRITICAL, CONF_CONFIRMED,
+                    "AlwaysInstallElevated enabled", NULL,
+                    "Both machine and user policy enable AlwaysInstallElevated: any "
+                    "MSI package installs with SYSTEM privileges. (INFO under an "
+                    "elevated auditor, which can already write the policy.)");
+    } else if (m || u) {
+        add_finding(fl, "auto.always_install_elevated_partial", CAT_AUTOSTART, SEV_MEDIUM,
+                    CONF_CONFIRMED, "AlwaysInstallElevated partially configured", NULL,
+                    "Set in %s policy only. It takes effect only when both the "
+                    "machine and user policies are enabled, but it indicates an "
+                    "elevation-oriented configuration.", m ? "machine" : "user");
+    }
+}
+
+/* ---- 4W.3 PATH ---------------------------------------------------------- */
+
+static void scan_filesystem(FindingList *fl, const Options *o) {
+    const char *path_env = getenv("PATH");
+    if (!path_env || !*path_env) return;
+
+    char copy[8192];
+    size_t plen = strlen(path_env);
+    if (plen >= sizeof(copy)) {
+        add_finding(fl, "fs.path_overlong", CAT_FILESYSTEM, SEV_LOW, CONF_CONFIRMED,
+                    "Overlong PATH value", NULL,
+                    "PATH is %zu bytes, exceeding this tool's %zu-byte parse buffer; "
+                    "it was truncated for analysis, so PATH results may be "
+                    "incomplete.", plen, sizeof(copy) - 1);
+    }
+    snprintf(copy, sizeof(copy), "%s", path_env);
+
+    char *p = copy;
+    while (1) {
+        char *semi = strchr(p, ';');
+        if (semi) *semi = '\0';
+
+        char *entry = trim(p);
+        size_t len = strlen(entry);
+        if (len >= 2 && entry[0] == '"' && entry[len - 1] == '"') {
+            entry[len - 1] = '\0';
+            entry++;
+            len -= 2;
+        }
+
+        if (*entry == '\0') {
+            add_finding(fl, "fs.path_empty_component", CAT_FILESYSTEM, SEV_MEDIUM,
+                        CONF_LIKELY, "Empty PATH component", NULL,
+                        "An empty PATH entry (leading/trailing/doubled semicolon) "
+                        "resolves to the current directory, enabling binary planting.");
+        } else if (!win_is_abs_path(entry)) {
+            add_finding(fl, "fs.path_relative", CAT_FILESYSTEM, SEV_MEDIUM, CONF_LIKELY,
+                        "Relative entry in PATH", entry,
+                        "A non-absolute PATH entry enables binary planting.");
+        } else {
+            char expanded[1024];
+            win_expand_env(entry, expanded, sizeof(expanded));
+            if (is_writable_by_me(expanded)) {
+                if (o->is_root) {
+                    add_finding(fl, "fs.path_writable_root_auditor", CAT_FILESYSTEM,
+                                SEV_INFO, CONF_CONFIRMED,
+                                "Writable PATH directory (elevated auditor)", expanded,
+                                "Writable by the identity running this audit; not an "
+                                "unprivileged escalation signal.");
+                } else {
+                    add_finding(fl, "fs.path_writable", CAT_FILESYSTEM, SEV_HIGH,
+                                CONF_CONFIRMED, "Writable directory in PATH", expanded,
+                                "A writable PATH directory allows planting a trojan "
+                                "executable or DLL.");
+                }
+            }
+        }
+
+        if (!semi) break;
+        p = semi + 1;
+    }
+}
+
+/* ---- 4W.4 Token privileges --------------------------------------------- */
+
+static void scan_privileges(FindingList *fl, const Options *o) {
+    static const struct {
+        const char *name;
+        Severity    sev;
+        const char *why;
+    } dangerous[] = {
+        { "SeCreateTokenPrivilege", SEV_CRITICAL,
+          "create arbitrary access tokens, including one for SYSTEM" },
+        { "SeTcbPrivilege", SEV_CRITICAL,
+          "act as part of the trusted computing base" },
+        { "SeImpersonatePrivilege", SEV_HIGH,
+          "impersonate tokens (potato-style SYSTEM escalation on many builds)" },
+        { "SeAssignPrimaryTokenPrivilege", SEV_HIGH,
+          "replace a process's primary token" },
+        { "SeDebugPrivilege", SEV_HIGH,
+          "open and modify arbitrary processes, including SYSTEM ones" },
+        { "SeTakeOwnershipPrivilege", SEV_HIGH,
+          "take ownership of any object, including system files" },
+        { "SeLoadDriverPrivilege", SEV_HIGH,
+          "load a kernel driver" },
+        { "SeTrustedCredManAccessPrivilege", SEV_HIGH,
+          "access stored credentials through Credential Manager" },
+        { "SeBackupPrivilege", SEV_MEDIUM,
+          "read any file regardless of its ACL" },
+        { "SeRestorePrivilege", SEV_MEDIUM,
+          "write any file regardless of its ACL" },
+        { "SeRelabelPrivilege", SEV_MEDIUM,
+          "change mandatory integrity labels" },
+        { "SeManageVolumePrivilege", SEV_MEDIUM,
+          "modify volume metadata, including filesystem journals" },
+        { NULL, SEV_INFO, NULL }
+    };
+
+    HANDLE tok = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        add_finding(fl, "priv.unavailable", CAT_PRIVILEGES, SEV_INFO, CONF_CONFIRMED,
+                    "Privilege scan unavailable", NULL,
+                    "OpenProcessToken failed (%s).", win_error_text(GetLastError()));
+        return;
+    }
+
+    DWORD len = 0;
+    GetTokenInformation(tok, TokenPrivileges, NULL, 0, &len);
+    TOKEN_PRIVILEGES *tp = malloc(len ? len : sizeof(TOKEN_PRIVILEGES));
+
+    if (tp && len && GetTokenInformation(tok, TokenPrivileges, tp, len, &len)) {
+        for (DWORD i = 0; i < tp->PrivilegeCount; i++) {
+            wchar_t wname[128];
+            DWORD wlen = (DWORD)(sizeof(wname) / sizeof(wname[0]));
+            if (!LookupPrivilegeNameW(NULL, &tp->Privileges[i].Luid, wname, &wlen))
+                continue;
+
+            char *name = win_utf8(wname);
+            if (!name) continue;
+
+            for (int t = 0; dangerous[t].name; t++) {
+                if (!str_eq_ci(name, dangerous[t].name)) continue;
+
+                bool enabled = (tp->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED) != 0;
+                add_finding(fl, "priv.dangerous", CAT_PRIVILEGES, dangerous[t].sev,
+                            CONF_CONFIRMED,
+                            enabled ? "Dangerous privilege enabled"
+                                    : "Dangerous privilege present (disabled)",
+                            name, "%s (%s in this token): %s.", name,
+                            enabled ? "enabled" : "held but disabled", dangerous[t].why);
+                break;
+            }
+            free(name);
+        }
+    }
+    free(tp);
+
+    /* Integrity level and elevation context (INFO). */
+    DWORD ilen = 0;
+    GetTokenInformation(tok, TokenIntegrityLevel, NULL, 0, &ilen);
+    TOKEN_MANDATORY_LABEL *tml = malloc(ilen ? ilen : 1);
+    if (tml && ilen && GetTokenInformation(tok, TokenIntegrityLevel, tml, ilen, &ilen)) {
+        DWORD *rid = GetSidSubAuthority(
+            tml->Label.Sid, (DWORD)(*GetSidSubAuthorityCount(tml->Label.Sid) - 1));
+        const char *label;
+        if (*rid < SECURITY_MANDATORY_MEDIUM_RID) label = "low";
+        else if (*rid < SECURITY_MANDATORY_HIGH_RID) label = "medium";
+        else if (*rid < SECURITY_MANDATORY_SYSTEM_RID) label = "high";
+        else label = "system";
+
+        add_finding(fl, "priv.integrity_level", CAT_PRIVILEGES, SEV_INFO, CONF_CONFIRMED,
+                    "Token integrity level", NULL,
+                    "Integrity level %s (RID 0x%lx), elevated=%s.", label,
+                    (unsigned long)*rid, o->is_root ? "yes" : "no");
+    }
+    free(tml);
+
+    CloseHandle(tok);
+}
+
+#endif /* _WIN32 */
+
+
+
+
 /* ========================================================================
  * Section 5: Output
  * ==================================================================== */
@@ -1941,12 +2970,23 @@ static void sort_findings(FindingList *fl) {
 
 static void print_banner(const HostInfo *h) {
     printf("========================================\n");
+#ifdef _WIN32
+    printf(" Windows Privilege Escalation Auditor\n");
+#else
     printf(" Linux Privilege Escalation Auditor\n");
+#endif
     printf("========================================\n\n");
     printf("User:   %s\n", h->user);
+#ifdef _WIN32
+    printf("OS:     %s\n", h->distro);
+    printf("Kernel: %s\n", h->kernel);
+    printf("Arch:   %s\n", h->arch);
+    printf("Elevated: %s\n", h->elevated ? "yes" : "no");
+#else
     printf("UID:    %u\n", (unsigned)h->uid);
     printf("Distro: %s\n", h->distro);
     printf("Kernel: %s\n", h->kernel);
+#endif
     printf("\n");
 }
 
@@ -2058,6 +3098,8 @@ static void report_json(const FindingList *fl, const Options *o, const HostInfo 
     printf("  \"tool\": \"%s\",\n", TOOL_NAME);
     printf("  \"version\": \"%s\",\n", TOOL_VERSION);
     printf("  \"host\": {\n");
+    printf("    \"platform\": \"%s\",\n", h->platform);
+    printf("    \"elevated\": %s,\n", h->elevated ? "true" : "false");
     printf("    \"user\": \""); json_escape(stdout, h->user); printf("\",\n");
     printf("    \"uid\": %u,\n", (unsigned)h->uid);
     printf("    \"distro\": \""); json_escape(stdout, h->distro); printf("\",\n");
@@ -2107,7 +3149,7 @@ static void report_json(const FindingList *fl, const Options *o, const HostInfo 
 
 static void usage(FILE *out) {
     fprintf(out,
-"%s %s - Linux Privilege Escalation Auditor (read-only)\n"
+"%s %s - Privilege Escalation Auditor (read-only, %s)\n"
 "\n"
 "USAGE:\n"
 "  %s [options]\n"
@@ -2118,13 +3160,27 @@ static void usage(FILE *out) {
 "  --verbose           Include INFO-level findings in output (text and JSON)\n"
 "  --json              Emit machine-readable JSON instead of text\n"
 "  --no-color          Disable ANSI colors in text output\n"
-"  --check <category>  Run only one category (repeatable)\n"
-"  --sudo-fallback      If /etc/sudoers can't be read directly, fall back to\n"
-"                       parsing `sudo -n -l` output. Opt-in: this shells out\n"
-"                       to sudo, can fail silently without a cached/non-\n"
-"                       interactive grant, and may write to the sudo log.\n"
-"\n"
-"CATEGORIES:\n"
+"  --check <category>  Run only one category (repeatable)\n",
+        TOOL_NAME, TOOL_VERSION, TOOL_PLATFORM, TOOL_NAME);
+
+#ifndef _WIN32
+    fprintf(out,
+"  --sudo-fallback     If /etc/sudoers can't be read directly, fall back to\n"
+"                      parsing `sudo -n -l` output. Opt-in: this shells out\n"
+"                      to sudo, can fail silently without a cached/non-\n"
+"                      interactive grant, and may write to the sudo log.\n");
+#endif
+
+    fprintf(out, "\nCATEGORIES:\n");
+#ifdef _WIN32
+    fprintf(out,
+"  system        Host / user / OS build enumeration\n"
+"  services      Windows services: unquoted paths, writable images\n"
+"  autostart     Run/RunOnce keys, Startup folders, AlwaysInstallElevated\n"
+"  filesystem    Writable PATH directories\n"
+"  privileges    Dangerous token privileges, integrity level\n");
+#else
+    fprintf(out,
 "  system        Host / user / kernel enumeration\n"
 "  suid          SUID / SGID binary scan\n"
 "  capabilities  File capability scan (Linux only)\n"
@@ -2133,12 +3189,13 @@ static void usage(FILE *out) {
 "  services      systemd unit review\n"
 "  processes     Root processes with writable binaries (Linux only)\n"
 "  filesystem    Writable PATH dirs / sensitive files / sticky bits\n"
-"  package       Kernel-version CVE heuristic (coarse) + package-based checks\n"
-"\n"
-"This tool only reads system state. Findings require human verification\n"
+"  package       Kernel-version CVE heuristic (coarse) + package-based checks\n");
+#endif
+
+    fprintf(out,
+"\nThis tool only reads system state. Findings require human verification\n"
 "and are NOT proof of exploitability. A nonzero exit code means findings\n"
-"were reported, not that exploitation was attempted or confirmed.\n",
-        TOOL_NAME, TOOL_VERSION, TOOL_NAME);
+"were reported, not that exploitation was attempted or confirmed.\n");
 }
 
 static int category_from_name(const char *name, Category *out) {
@@ -2151,11 +3208,34 @@ static int category_from_name(const char *name, Category *out) {
     return -1;
 }
 
+/* Scans implemented on this platform. Selecting a category that only exists
+ * on the other platform produces an INFO finding rather than a silent no-op. */
+static bool category_available(Category c) {
+#ifdef _WIN32
+    switch (c) {
+        case CAT_SYSTEM:
+        case CAT_SERVICES:
+        case CAT_AUTOSTART:
+        case CAT_FILESYSTEM:
+        case CAT_PRIVILEGES:
+            return true;
+        default:
+            return false;
+    }
+#else
+    return c != CAT_AUTOSTART && c != CAT_PRIVILEGES;
+#endif
+}
+
 int main(int argc, char **argv) {
     Options o;
     o.verbose = false;
     o.json = false;
+#ifdef _WIN32
+    o.use_color = _isatty(_fileno(stdout)) ? true : false;
+#else
     o.use_color = isatty(STDOUT_FILENO) ? true : false;
+#endif
     o.is_root = false;
     o.sudo_fallback = false;
     o.selected = 0;
@@ -2195,7 +3275,11 @@ int main(int argc, char **argv) {
 
     HostInfo host;
     gather_host_info(&host);
+#ifdef _WIN32
+    o.is_root = host.elevated;
+#else
     o.is_root = (host.uid == 0);
+#endif
 
     FindingList fl;
     fl_init(&fl);
@@ -2211,6 +3295,7 @@ int main(int argc, char **argv) {
         scan_system(&fl, &host, &o);
         ran[nran++] = "System enumeration";
     }
+#ifndef _WIN32
     if (cat_selected(&o, CAT_SUID)) {
         scan_suid(&fl, &o, &stats);
         ran[nran++] = "SUID/SGID scan";
@@ -2227,21 +3312,49 @@ int main(int argc, char **argv) {
         scan_cron(&fl, &o, &stats);
         ran[nran++] = "Cron scan";
     }
+#endif
     if (cat_selected(&o, CAT_SERVICES)) {
         scan_services(&fl, &o, &stats);
         ran[nran++] = "Service scan";
     }
+#ifndef _WIN32
     if (cat_selected(&o, CAT_PROCESSES)) {
         scan_processes(&fl, &o);
         ran[nran++] = "Process scan";
     }
+#endif
     if (cat_selected(&o, CAT_FILESYSTEM)) {
         scan_filesystem(&fl, &o);
         ran[nran++] = "Filesystem scan";
     }
+#ifdef _WIN32
+    if (cat_selected(&o, CAT_AUTOSTART)) {
+        scan_autostart(&fl, &o);
+        ran[nran++] = "Autostart scan";
+    }
+    if (cat_selected(&o, CAT_PRIVILEGES)) {
+        scan_privileges(&fl, &o);
+        ran[nran++] = "Privilege scan";
+    }
+#else
     if (cat_selected(&o, CAT_PACKAGE)) {
         scan_package(&fl, &host, &o);
         ran[nran++] = "Package/CVE scan";
+    }
+#endif
+
+    /* A category selected with --check that only exists on the other platform. */
+    for (int c = 0; c < CAT_COUNT; c++) {
+        if (!cat_selected(&o, (Category)c) || category_available((Category)c)) continue;
+#ifdef _WIN32
+        const char *other = "Linux";
+#else
+        const char *other = "Windows";
+#endif
+        add_finding(&fl, "platform.not_applicable", (Category)c, SEV_INFO, CONF_CONFIRMED,
+                    "Scan not applicable on this platform", NULL,
+                    "The '%s' scan is implemented in the %s build only.",
+                    category_name((Category)c), other);
     }
 
     sort_findings(&fl);

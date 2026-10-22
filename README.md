@@ -1,8 +1,8 @@
-# privesc-auditor — Linux Privilege Escalation Auditor
+# privesc-auditor — Linux & Windows Privilege Escalation Auditor
 
 A small, dependency-free, **read-only** command-line tool that enumerates a
-Linux system for common privilege-escalation *misconfigurations* and reports
-them as prioritized findings for human review.
+Linux or Windows system for common privilege-escalation *misconfigurations* and
+reports them as prioritized findings for human review.
 
 It is written for authorized security audits, system hardening, and CTF
 practice. It performs **no exploitation** and makes **no changes** to the host.
@@ -40,6 +40,20 @@ ranked by severity, so a human can focus on verification and remediation.
 - Emits either a human-readable report or machine-readable JSON.
 - Returns an exit code reflecting the worst severity found (useful in CI).
 
+On **Windows** the same report model is filled by Windows equivalents:
+
+- Enumerates the OS edition/build, architecture, user, token elevation and
+  integrity level.
+- Reviews services for **unquoted image paths** (with the exact files the
+  loader would try first) and for service images or image directories writable
+  by the current user, weighted by the account the service runs as.
+- Reviews autostart: machine-wide `Run`/`RunOnce` keys (writability of the key
+  and of each target), the all-users and per-user Startup folders, and
+  `AlwaysInstallElevated`.
+- Checks `%PATH%` for writable, relative, or empty entries.
+- Reports dangerous token privileges (`SeImpersonate`, `SeDebug`,
+  `SeTakeOwnership`, `SeLoadDriver`, `SeTcb`, …).
+
 ## What the tool does NOT do
 
 - It does **not** exploit anything, launch payloads, or attempt escalation.
@@ -51,11 +65,15 @@ ranked by severity, so a human can focus on verification and remediation.
   symlink-based surprises).
 - It does **not** perform authenticated package-manager queries or consult a
   live CVE feed; CVE matching is a local, version-range heuristic only.
+- On Windows it does **not** enumerate scheduled tasks, installed updates
+  (build-versus-CVE matching), stored credentials, or weak service ACLs
+  (DACL grants on the service object itself); the first two are on the roadmap.
 
 ## Installation
 
-No dependencies beyond a C11 compiler and a POSIX libc. Copy `main.c` to the
-target and compile (see below). The result is a single self-contained binary.
+No dependencies beyond a C11 compiler and the platform API: a POSIX libc on
+Linux/macOS, the Win32 API on Windows. Copy `main.c` to the target and compile
+(see below). The result is a single self-contained binary per platform.
 
 ```bash
 git clone <your-repo> privesc-auditor && cd privesc-auditor
@@ -69,6 +87,14 @@ Standard build (warnings-as-documentation, with compiler hardening):
 cc -std=c11 -Wall -Wextra -Wpedantic -O2 \
    -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
    -o privesc-auditor main.c
+```
+
+Windows build (cross-compiling from Linux with mingw-w64; the same command
+works natively with MSVC's `cl /std:c11 main.c`):
+
+```bash
+x86_64-w64-mingw32-gcc -std=c11 -Wall -Wextra -Wpedantic -O2 \
+   -o privesc-auditor.exe main.c
 ```
 
 Development build with sanitizers (recommended while modifying the code):
@@ -85,9 +111,12 @@ cc -std=c11 -Wall -Wextra -Wpedantic -g -O1 \
 > Apple-ASan, not a defect in this program. Use the UndefinedBehaviorSanitizer
 > build (`-fsanitize=undefined`) on macOS, or run the ASan build on Linux.
 
-The tool targets Linux at runtime. It still compiles and runs on macOS/BSD,
-where Linux-only scans (capabilities, `/proc` processes) are skipped with an
-informational note.
+The binary targets the platform it was built for: the POSIX build runs on
+Linux (and compiles/runs on macOS/BSD, where Linux-only scans such as
+capabilities and `/proc` processes are skipped with an informational note), and
+the Windows build uses the Win32 API. The platform is selected at compile time
+with `_WIN32`; selecting a category that only exists on the other platform with
+`--check` yields an INFO finding instead of a silent no-op.
 
 ## Usage
 
@@ -96,6 +125,7 @@ informational note.
 ./privesc-auditor --verbose    # include INFO-level findings
 ./privesc-auditor --json       # machine-readable JSON
 ./privesc-auditor --check suid # run a single category (repeatable)
+./privesc-auditor.exe --check services   # Windows build
 ./privesc-auditor --help
 ```
 
@@ -109,6 +139,7 @@ informational note.
 | `--json`            | Emit JSON instead of the text report.                   |
 | `--no-color`        | Disable ANSI colors (also auto-off when not a TTY).     |
 | `--check <cat>`     | Run only the named category. Repeat to select several.  |
+| `--sudo-fallback`   | POSIX only: parse `sudo -n -l` if sudoers is unreadable. |
 
 **Exit codes:** `0` = nothing notable, `1` = low/medium findings,
 `2` = at least one high, `3` = at least one critical. Error in arguments = `2`
@@ -116,23 +147,25 @@ informational note.
 
 ## Scanner categories
 
-| Category       | What it inspects                                                   |
-| -------------- | ----------------------------------------------------------------- |
-| `system`       | User, uid/gid, distro, kernel, architecture.                      |
-| `suid`         | SUID/SGID binaries; writable / known-risky / non-baseline ones.   |
-| `capabilities` | File capabilities via `security.capability` xattr (Linux only).   |
-| `sudo`         | `/etc/sudoers` and `/etc/sudoers.d/*` policy review.              |
-| `cron`         | System crontab, `cron.d`/`cron.*`, spool dirs; writable targets.  |
-| `services`     | systemd unit files and their `ExecStart` targets.                 |
-| `processes`    | Root-owned processes with a writable on-disk executable (Linux).  |
-| `filesystem`   | Writable `$PATH` dirs, relative `$PATH`, sticky bits, sensitive files. |
-| `package`      | Kernel-version heuristic against a small built-in CVE table.      |
+| Category       | Platform | What it inspects                                            |
+| -------------- | -------- | ----------------------------------------------------------- |
+| `system`       | both     | User, ids/elevation, distro or OS build, kernel, architecture. |
+| `suid`         | Linux    | SUID/SGID binaries; writable / known-risky / non-baseline.  |
+| `capabilities` | Linux    | File capabilities via `security.capability` xattr.          |
+| `sudo`         | Linux    | `/etc/sudoers`, includes and drop-ins; writable policy.     |
+| `cron`         | Linux    | System crontab, `cron.d`/`cron.*`, spool dirs, writable targets. |
+| `services`     | both     | Linux: systemd units and `ExecStart`. Windows: unquoted paths, writable images/dirs. |
+| `processes`    | Linux    | Root-owned processes with a writable on-disk executable.    |
+| `filesystem`   | both     | Writable `PATH` entries; Linux also sticky bits and sensitive files. |
+| `package`      | Linux    | Kernel-version heuristic against a small built-in CVE table. |
+| `autostart`    | Windows  | `Run`/`RunOnce` keys, Startup folders, `AlwaysInstallElevated`. |
+| `privileges`   | Windows  | Dangerous token privileges, integrity level.                |
 
 ## Severity levels
 
 | Level      | Meaning                                                              |
 | ---------- | ------------------------------------------------------------------- |
-| `CRITICAL` | Direct, high-confidence escalation primitive (e.g. writable SUID root binary, writable sudoers policy file or drop-in directory, writable `/etc/passwd`). |
+| `CRITICAL` | Direct, high-confidence escalation primitive (e.g. writable SUID root binary, writable sudoers policy file, writable service image running as SYSTEM, writable machine-wide `Run` key, writable `/etc/passwd`). |
 | `HIGH`     | Strong escalation path likely (writable cron/service target, dangerous capability, writable `$PATH`). |
 | `MEDIUM`   | Notable misconfiguration worth investigating (non-baseline SUID, passwordless sudo rule, missing sticky bit). |
 | `LOW`      | Minor hygiene issue.                                                 |
@@ -190,10 +223,18 @@ Always confirm manually before acting on a finding.
   crontabs, root-only unit directories); those are silently skipped, so a run
   as root will naturally surface more.
 - The tool never requests or needs elevated privileges to do its work.
+- **Windows:** permissions are evaluated with `AccessCheck` against each
+  object's DACL using the current token, so nothing is opened for writing. Run
+  it from a normal (non-elevated) prompt to see what a standard user could do;
+  running elevated sets the same "privileged auditor" mode as root on POSIX,
+  downgrading self-caused readability/writability findings to INFO so they
+  don't masquerade as escalation paths.
 
 ## Security considerations
 
-- The tool only **reads** state; it never writes to the host.
+- The tool only **reads** state; it never writes to the host (on Windows it
+  queries the SCM, registry and token APIs, and evaluates ACLs rather than
+  opening files for write access).
 - It never follows symlinks during directory walks, avoiding symlink loops and
   redirection to unexpected targets.
 - Directory walks are depth-bounded to avoid pathological traversal.
@@ -268,3 +309,18 @@ JSON output (`--json`) mirrors the same data as a single object with `host`,
 - The CVE heuristic is coarse and backport-blind (see above).
 - Findings are **audit results requiring human verification, not automatic
   proof of exploitability.**
+
+### Windows-specific
+
+- Unquoted service paths report every file name the loader would try before the
+  real image. A `MEDIUM`/`POSSIBLE` finding means "ambiguous path, no candidate
+  directory is writable by you"; `HIGH`/`CONFIRMED` means one is.
+- Writable-service severity depends on the configured account: SYSTEM,
+  LocalService and NetworkService count as privileged (CRITICAL for the image),
+  any other account is HIGH/MEDIUM.
+- Token privileges are reported by presence, with the detail stating whether
+  each one is currently enabled — an administrator token typically holds
+  `SeDebugPrivilege` disabled.
+- Machine-wide `Run` keys and the all-users Startup folder are judged by their
+  DACL; the per-user Startup folder is reported as LOW because being writable
+  by its owner is normal.

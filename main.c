@@ -24,6 +24,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <ctype.h>
 #include <errno.h>
 #include <dirent.h>
@@ -49,7 +50,7 @@
  * ==================================================================== */
 
 #define TOOL_NAME    "privesc-auditor"
-#define TOOL_VERSION "1.1.0"
+#define TOOL_VERSION "1.2.0"
 
 typedef enum {
     SEV_INFO = 0,
@@ -274,28 +275,96 @@ static bool looks_like_env_assign(const char *tok) {
     return true;
 }
 
-/* ---- Dev/inode "seen" set, for cross-root dedup (fixes.md item 6) ------ */
+/* ---- Dev/inode "seen" set, for cross-root dedup (fixes.md item 6) ------
+ *
+ * Open-addressed hash set (linear probing), not a linear-scan array: every
+ * directory and file visited by walk_dir() is inserted here, so testing
+ * membership against an array made a whole scan quadratic in the file count
+ * (measured on this code: 10k files ~0.05s, 20k ~0.16s, 40k ~0.57s). The
+ * API is unchanged; callers still get "was this (dev,ino) already seen?". */
 
 typedef struct { dev_t dev; ino_t ino; } DevIno;
-typedef struct { DevIno *items; size_t count, cap; } SeenSet;
 
-static void seen_set_init(SeenSet *s) { s->items = NULL; s->count = s->cap = 0; }
-static void seen_set_free(SeenSet *s) { free(s->items); s->items = NULL; s->count = s->cap = 0; }
+typedef struct {
+    DevIno        *slots;
+    unsigned char *used;
+    size_t         cap;   /* power of two; 0 until first insert */
+    size_t         count; /* live entries */
+} SeenSet;
+
+static void seen_set_init(SeenSet *s) {
+    s->slots = NULL;
+    s->used = NULL;
+    s->cap = 0;
+    s->count = 0;
+}
+
+static void seen_set_free(SeenSet *s) {
+    free(s->slots);
+    free(s->used);
+    seen_set_init(s);
+}
+
+static size_t seen_hash(dev_t dev, ino_t ino, size_t cap) {
+    uint64_t x = (uint64_t)(uintmax_t)dev * 0x9E3779B97F4A7C15ULL +
+                 (uint64_t)(uintmax_t)ino + 0x165667B19E3779F9ULL;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 29;
+    return (size_t)(x & (uint64_t)(cap - 1));
+}
+
+static bool seen_set_grow(SeenSet *s) {
+    size_t ncap = s->cap ? s->cap * 2 : 256;
+    DevIno *slots = calloc(ncap, sizeof(*slots));
+    unsigned char *used = calloc(ncap, 1);
+    if (!slots || !used) {
+        free(slots);
+        free(used);
+        return false;
+    }
+    for (size_t i = 0; i < s->cap; i++) {
+        if (!s->used[i]) continue;
+        size_t j = seen_hash(s->slots[i].dev, s->slots[i].ino, ncap);
+        while (used[j]) j = (j + 1) & (ncap - 1);
+        used[j] = 1;
+        slots[j] = s->slots[i];
+    }
+    free(s->slots);
+    free(s->used);
+    s->slots = slots;
+    s->used = used;
+    s->cap = ncap;
+    return true;
+}
 
 /* Returns true if (dev,ino) was already present (i.e. this is a duplicate);
  * otherwise records it and returns false. */
 static bool seen_set_check_add(SeenSet *s, dev_t dev, ino_t ino) {
-    for (size_t i = 0; i < s->count; i++)
-        if (s->items[i].dev == dev && s->items[i].ino == ino) return true;
-    if (s->count == s->cap) {
-        size_t ncap = s->cap ? s->cap * 2 : 64;
-        DevIno *tmp = realloc(s->items, ncap * sizeof(*tmp));
-        if (!tmp) return false; /* best effort: fail open, don't crash */
-        s->items = tmp;
-        s->cap = ncap;
+    /* Keep load factor under 70% so linear probing stays cheap. */
+    if (s->cap == 0 || (s->count + 1) * 10 >= s->cap * 7) {
+        if (!seen_set_grow(s)) {
+            /* Allocation failure: still answer the membership question from
+             * the existing table, but don't record the new entry (fail open,
+             * as before - a possible duplicate beats a crash or a miss). */
+            for (size_t i = 0; i < s->cap; i++)
+                if (s->used[i] && s->slots[i].dev == dev && s->slots[i].ino == ino)
+                    return true;
+            return false;
+        }
     }
-    s->items[s->count++] = (DevIno){ dev, ino };
-    return false;
+
+    size_t i = seen_hash(dev, ino, s->cap);
+    for (;;) {
+        if (!s->used[i]) {
+            s->used[i] = 1;
+            s->slots[i] = (DevIno){ dev, ino };
+            s->count++;
+            return false;
+        }
+        if (s->slots[i].dev == dev && s->slots[i].ino == ino) return true;
+        i = (i + 1) & (s->cap - 1);
+    }
 }
 
 /* ========================================================================
@@ -410,6 +479,45 @@ static const char *dangerous_suid[] = {
     NULL
 };
 
+/*
+ * Binaries that are *expected* to be SGID on a normal Linux system (mail,
+ * shadow, tty, crontab, ssh-agent and utempter helpers). Root-owned SGID on
+ * one of these paths is reported as INFO; any other root-owned SGID binary is
+ * still reported for review.
+ *
+ * Without this list every stock Debian/Ubuntu host produced a MEDIUM finding
+ * for each of chage, expiry, unix_chkpwd, pam_extrausers_chkpwd, ssh-agent and
+ * utempter, which is baseline noise rather than a misconfiguration. As with
+ * known_suid[], the list is path-based (not basename-based) so a copy of a
+ * trusted binary planted somewhere else is not silently whitelisted.
+ */
+static const char *known_sgid[] = {
+    "/usr/bin/chage", "/bin/chage",
+    "/usr/bin/expiry", "/bin/expiry",
+    "/usr/bin/wall", "/bin/wall",
+    "/usr/bin/write", "/bin/write",
+    "/usr/bin/bsd-write", "/bin/bsd-write",
+    "/usr/bin/crontab", "/bin/crontab",
+    "/usr/bin/locate", "/bin/locate",
+    "/usr/bin/mlocate", "/bin/mlocate",
+    "/usr/bin/ssh-agent", "/bin/ssh-agent",
+    "/usr/bin/screen", "/bin/screen",
+    "/usr/sbin/unix_chkpwd", "/sbin/unix_chkpwd",
+    "/usr/sbin/pam_extrausers_chkpwd", "/sbin/pam_extrausers_chkpwd",
+    "/usr/lib/openssh/ssh-keysign",
+    "/usr/lib/utempter/utempter",
+    "/usr/libexec/utempter/utempter",
+    "/usr/lib/dbus-1.0/dbus-daemon-launch-helper",
+    "/usr/libexec/dbus-1/dbus-daemon-launch-helper",
+    "/usr/lib/postfix/postdrop",
+    "/usr/lib/postfix/postqueue",
+    "/usr/libexec/postfix/postdrop",
+    "/usr/libexec/postfix/postqueue",
+    "/usr/sbin/postdrop", "/usr/sbin/postqueue",
+    "/usr/lib/mailutils/dotlock",
+    NULL
+};
+
 static bool basename_in(const char *path, const char *const *list) {
     const char *b = strrchr(path, '/');
     b = b ? b + 1 : path;
@@ -424,6 +532,34 @@ static bool basename_in(const char *path, const char *const *list) {
 static bool path_in(const char *path, const char *const *list) {
     for (int i = 0; list[i]; i++)
         if (strcmp(path, list[i]) == 0) return true;
+    return false;
+}
+
+/* SGID baseline lookup. Exact paths cover the common layouts; a few helpers
+ * also live under a multiarch triplet directory (/usr/lib/<triplet>/...),
+ * which cannot be enumerated statically, so those are matched by suffix - but
+ * only inside the trusted /usr/lib and /usr/libexec trees, so a planted copy
+ * of a trusted helper elsewhere is never whitelisted. */
+static bool sgid_baseline_path(const char *path) {
+    if (path_in(path, known_sgid)) return true;
+
+    if (strncmp(path, "/usr/lib/", 9) != 0 && strncmp(path, "/usr/libexec/", 13) != 0)
+        return false;
+
+    static const char *suffixes[] = {
+        "/utempter/utempter",
+        "/dbus-1.0/dbus-daemon-launch-helper",
+        "/postfix/postdrop",
+        "/postfix/postqueue",
+        "/mailutils/dotlock",
+        "/openssh/ssh-keysign",
+        NULL
+    };
+    size_t plen = strlen(path);
+    for (int i = 0; suffixes[i]; i++) {
+        size_t slen = strlen(suffixes[i]);
+        if (plen > slen && strcmp(path + plen - slen, suffixes[i]) == 0) return true;
+    }
     return false;
 }
 
@@ -561,13 +697,23 @@ static void suid_cb(const char *path, const struct stat *st, void *vctx) {
                     "not root's.", (unsigned)st->st_uid);
     }
 
-    /* --- fixes.md item 3: SGID as a first-class, separately-flagged case --- */
+    /* --- fixes.md item 3: SGID as a first-class, separately-flagged case ---
+     * Uses the SGID baseline the same way the SUID branch above uses
+     * known_suid[], so stock shadow/tty/mail helpers stay INFO instead of
+     * producing a MEDIUM finding on every normal host. */
     if (sgid) {
-        if (root_owned) {
+        bool baseline_sgid = sgid_baseline_path(path);
+        if (root_owned && baseline_sgid) {
+            add_finding(c->fl, "suid.sgid_baseline", CAT_SUID, SEV_INFO, CONF_CONFIRMED,
+                        "Standard SGID binary", path,
+                        "SGID binary (group gid=%u) on the expected baseline list.",
+                        (unsigned)st->st_gid);
+        } else if (root_owned) {
             add_finding(c->fl, "suid.sgid_root", CAT_SUID, SEV_MEDIUM, CONF_POSSIBLE,
                         "Root-owned SGID binary", path,
                         "SGID bit grants the file's group on execution (group "
-                        "gid=%u). Verify this is expected for this binary.",
+                        "gid=%u) and the path is not on the expected SGID "
+                        "baseline. Verify this is expected.",
                         (unsigned)st->st_gid);
         } else {
             add_finding(c->fl, "suid.sgid_nonroot", CAT_SUID, SEV_LOW, CONF_POSSIBLE,
@@ -686,10 +832,15 @@ static void scan_capabilities(FindingList *fl, const Options *o, ScanStats *stat
  *     and always label that fallback explicitly (it shells out, can fail
  *     silently, and may write to the system sudo log).
  *   - honor #include / #includedir directives instead of treating them as
- *     plain comments.
+ *     plain comments (sudo 1.9+ also accepts the @include / @includedir
+ *     spelling, which is what many current distros ship).
  *   - skip sudoers.d filenames containing '.' or ending in '~', which real
  *     sudo/visudo ignore.
  *   - a writable /etc/sudoers under a root auditor is expected, not a finding.
+ *   - a writable sudoers *include* file, or a writable sudoers directory, is
+ *     the same escalation primitive as a writable /etc/sudoers; only the
+ *     top-level file used to be checked, so a world-writable drop-in under
+ *     /etc/sudoers.d was silently ignored.
  */
 
 #define SUDO_INCLUDE_MAX_DEPTH 8
@@ -725,10 +876,30 @@ static void inspect_sudo_line(FindingList *fl, const char *source, const char *s
     }
 }
 
-static void scan_sudo_dir(FindingList *fl, const char *dir, int depth, ScanStats *stats);
+static void scan_sudo_dir(FindingList *fl, const Options *o, const char *dir, int depth,
+                          ScanStats *stats);
 
-static void scan_sudo_file(FindingList *fl, const char *path, int depth, ScanStats *stats) {
+static void scan_sudo_file(FindingList *fl, const Options *o, const char *path, int depth,
+                           ScanStats *stats) {
     if (depth > SUDO_INCLUDE_MAX_DEPTH) return;
+
+    /* Checked before the read attempt: a policy file we can write but not read
+     * is still writable, and injecting a rule is the escalation.
+     * Covers /etc/sudoers itself as well as every #include'd / @include'd file. */
+    if (is_writable_by_me(path)) {
+        if (o->is_root) {
+            add_finding(fl, "sudo.sudoers_writable_root_auditor", CAT_SUDO, SEV_INFO,
+                        CONF_CONFIRMED, "Writable sudoers file (root auditor)", path,
+                        "Writable by root, the identity running this audit; not an "
+                        "unprivileged escalation signal.");
+        } else {
+            add_finding(fl, "sudo.sudoers_writable", CAT_SUDO, SEV_CRITICAL, CONF_CONFIRMED,
+                        "Writable sudoers file", path,
+                        "This sudo policy file is writable by the current user, so "
+                        "arbitrary rules (for example NOPASSWD: ALL) could be added.");
+        }
+    }
+
     FILE *fp = fopen(path, "r");
     if (!fp) {
         if (errno == ENOENT) stats->roots_missing_expected++;
@@ -741,14 +912,14 @@ static void scan_sudo_file(FindingList *fl, const char *path, int depth, ScanSta
         char *s = trim(line);
         if (*s == '\0') continue;
 
-        if (*s == '#') {
-            /* #include / #includedir are directives, not comments. */
-            if (strncmp(s, "#include ", 9) == 0) {
-                char *inc = trim(s + 9);
-                scan_sudo_file(fl, inc, depth + 1, stats);
-            } else if (strncmp(s, "#includedir ", 12) == 0) {
-                char *incdir = trim(s + 12);
-                scan_sudo_dir(fl, incdir, depth + 1, stats);
+        if (*s == '#' || *s == '@') {
+            /* #include/#includedir (and sudo 1.9+ @include/@includedir) are
+             * directives, not comments. */
+            const char *rest = s + 1;
+            if (strncmp(rest, "include ", 8) == 0) {
+                scan_sudo_file(fl, o, trim((char *)rest + 8), depth + 1, stats);
+            } else if (strncmp(rest, "includedir ", 11) == 0) {
+                scan_sudo_dir(fl, o, trim((char *)rest + 11), depth + 1, stats);
             }
             continue; /* ordinary comment, or directive already handled */
         }
@@ -758,8 +929,26 @@ static void scan_sudo_file(FindingList *fl, const char *path, int depth, ScanSta
     fclose(fp);
 }
 
-static void scan_sudo_dir(FindingList *fl, const char *dir, int depth, ScanStats *stats) {
+static void scan_sudo_dir(FindingList *fl, const Options *o, const char *dir, int depth,
+                          ScanStats *stats) {
     if (depth > SUDO_INCLUDE_MAX_DEPTH) return;
+
+    /* sudo reads every active file in the directory, so being able to create
+     * one is equivalent to being able to write the policy. */
+    if (is_writable_by_me(dir)) {
+        if (o->is_root) {
+            add_finding(fl, "sudo.sudoers_dir_writable_root_auditor", CAT_SUDO, SEV_INFO,
+                        CONF_CONFIRMED, "Writable sudoers directory (root auditor)",
+                        dir, "Writable by root, the identity running this audit; "
+                        "not an unprivileged escalation signal.");
+        } else {
+            add_finding(fl, "sudo.sudoers_dir_writable", CAT_SUDO, SEV_CRITICAL,
+                        CONF_CONFIRMED, "Writable sudoers directory", dir,
+                        "New sudo policy files could be dropped here; sudo reads "
+                        "every active file in this directory.");
+        }
+    }
+
     DIR *d = opendir(dir);
     if (!d) {
         if (errno == ENOENT) stats->roots_missing_expected++;
@@ -772,7 +961,7 @@ static void scan_sudo_dir(FindingList *fl, const char *dir, int depth, ScanStats
         if (de->d_name[0] == '.') continue;
         if (!sudoers_filename_active(de->d_name)) continue; /* item 9: visudo-ignored names */
         snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
-        scan_sudo_file(fl, p, depth, stats);
+        scan_sudo_file(fl, o, p, depth, stats);
     }
     closedir(d);
 }
@@ -781,7 +970,7 @@ static void scan_sudo(FindingList *fl, const Options *o, ScanStats *stats) {
     FILE *probe = fopen("/etc/sudoers", "r");
     if (probe) {
         fclose(probe);
-        scan_sudo_file(fl, "/etc/sudoers", 0, stats);
+        scan_sudo_file(fl, o, "/etc/sudoers", 0, stats);
     } else {
         int err = errno;
         add_finding(fl, "sudo.sudoers_unreadable", CAT_SUDO, SEV_INFO, CONF_CONFIRMED,
@@ -825,22 +1014,11 @@ static void scan_sudo(FindingList *fl, const Options *o, ScanStats *stats) {
         }
     }
 
-    scan_sudo_dir(fl, "/etc/sudoers.d", 0, stats);
-
-    /* Writable sudoers is itself critical - unless we ARE root, in which case
-     * root being able to write its own policy file is not an escalation. */
-    if (is_writable_by_me("/etc/sudoers")) {
-        if (o->is_root) {
-            add_finding(fl, "sudo.sudoers_writable_root_auditor", CAT_SUDO, SEV_INFO,
-                        CONF_CONFIRMED, "/etc/sudoers writable (root auditor)",
-                        "/etc/sudoers", "Writable by root, the identity running "
-                        "this audit; not an unprivileged escalation signal.");
-        } else {
-            add_finding(fl, "sudo.sudoers_writable", CAT_SUDO, SEV_CRITICAL,
-                        CONF_CONFIRMED, "Writable /etc/sudoers", "/etc/sudoers",
-                        "The sudoers policy file is writable by the current user.");
-        }
-    }
+    /* Writability of /etc/sudoers itself, of every include, and of the
+     * sudoers.d directory is reported from scan_sudo_file()/scan_sudo_dir()
+     * so that one code path covers all of them instead of only the top-level
+     * file. */
+    scan_sudo_dir(fl, o, "/etc/sudoers.d", 0, stats);
 }
 
 /* ---- 4.4 Cron scan ------------------------------------------------------
@@ -871,14 +1049,78 @@ static bool is_shell_noise_token(const char *tok) {
     return false;
 }
 
+/* Shell builtins and control keywords that can legitimately appear as the
+ * command word of a cron job (`cd / && run-parts ...` is in Debian's stock
+ * /etc/crontab). They are never resolved through PATH, so flagging them as
+ * a "relative command" would only add noise. */
+static bool is_shell_builtin(const char *tok) {
+    static const char *builtins[] = {
+        "cd", "exec", "eval", "source", ".", ":", "set", "unset", "export",
+        "local", "readonly", "declare", "typeset", "shift", "return", "exit",
+        "true", "false", "echo", "printf", "read", "umask", "trap", "wait",
+        "alias", "unalias", "type", "command", "builtin", "let", "ulimit",
+        "getopts", "break", "continue", "kill", "pwd", "hash", "jobs",
+        NULL
+    };
+    for (int i = 0; builtins[i]; i++)
+        if (strcmp(tok, builtins[i]) == 0) return true;
+    return false;
+}
+
+/* Strip shell quoting and separators from a path token in place, so that
+ * `'/opt/x.sh'`, `/opt/x.sh;`, `/opt/x.sh)` and `/opt/x.sh` all resolve to
+ * the same file. Without this, every quoted path in a cron job or in the
+ * scripts under /etc/cron.{hourly,daily,...} silently failed the stat() and
+ * was never checked for writability. */
+static void strip_shell_affixes(char *tok) {
+    static const char *affix = "\"'`;|&(){}[]<>,!";
+    size_t len = strlen(tok);
+    size_t start = 0;
+    while (tok[start] && strchr(affix, tok[start])) start++;
+    if (start) {
+        memmove(tok, tok + start, len - start + 1);
+        len -= start;
+    }
+    while (len > 0 && strchr(affix, tok[len - 1])) tok[--len] = '\0';
+}
+
 /* Inspect a whitespace-tokenized command string (already past schedule/user
- * fields) for absolute paths worth a writability check. cmd_user may be NULL
- * (per-user crontab / script context: "runs as the owning user"). */
+ * fields) for absolute paths worth a writability check.
+ *
+ * job_context separates the two callers:
+ *   - true:  a crontab command field. A relative command is worth a single
+ *            note there, since cron resolves it through PATH.
+ *   - false: the body of a script in /etc/cron.{hourly,daily,weekly,monthly}.
+ *            That is arbitrary shell code, so tokens such as `if`, `]`, `\`
+ *            or `local` are ordinary syntax, not findings; only absolute
+ *            paths are inspected. Reporting every non-absolute token there
+ *            used to bury real findings under 150+ LOW false positives on a
+ *            stock Debian/Ubuntu host.
+ *
+ * cmd_user may be NULL (per-user crontab / script context: "runs as the
+ * owning user"). */
 static void inspect_token_list(FindingList *fl, const Options *o, const char *file,
-                               const char *cmd_user, char *s) {
+                               const char *cmd_user, char *s, bool job_context) {
     char *save = NULL;
+    bool command_position = true; /* next non-wrapper token is a command word */
+
     for (char *tok = strtok_r(s, " \t", &save); tok; tok = strtok_r(NULL, " \t", &save)) {
         if (looks_like_env_assign(tok)) continue;
+
+        /* A control operator ends a command and starts a new one, so what
+         * follows is again in command position. This runs on the raw token,
+         * before quote/separator stripping, because stripping would erase an
+         * operator such as "&&" entirely. */
+        if (strcmp(tok, "&&") == 0 || strcmp(tok, "||") == 0 ||
+            strcmp(tok, ";") == 0 || strcmp(tok, "|") == 0 ||
+            strcmp(tok, "&") == 0 || strcmp(tok, "then") == 0 ||
+            strcmp(tok, "else") == 0 || strcmp(tok, "do") == 0) {
+            command_position = true;
+            continue;
+        }
+
+        strip_shell_affixes(tok);
+        if (*tok == '\0') continue;
 
         bool is_wrapper = false;
         const char *b = strrchr(tok, '/'); b = b ? b + 1 : tok;
@@ -897,20 +1139,27 @@ static void inspect_token_list(FindingList *fl, const Options *o, const char *fi
         if (is_shell_noise_token(tok)) continue;
 
         if (tok[0] != '/') {
-            if (cmd_user)
-                add_finding(fl, "cron.unparsed_token", CAT_CRON, SEV_LOW, CONF_POSSIBLE,
-                            "Relative or unrecognized token in cron job", file,
-                            "Token '%.100s' (job runs as %s) is relative or not a "
-                            "recognized wrapper; not inspected for writability.",
-                            tok, cmd_user);
-            else
-                add_finding(fl, "cron.unparsed_token", CAT_CRON, SEV_LOW, CONF_POSSIBLE,
-                            "Relative or unrecognized token in cron job", file,
-                            "Token '%.100s' is relative or not a recognized "
-                            "wrapper; not inspected for writability.", tok);
+            /* Only a relative *command* word of a real crontab job is
+             * interesting. Its arguments and script syntax are not, so this
+             * must be in command position and must not be a shell builtin. */
+            if (job_context && command_position && !is_shell_builtin(tok)) {
+                if (cmd_user)
+                    add_finding(fl, "cron.unparsed_token", CAT_CRON, SEV_LOW, CONF_POSSIBLE,
+                                "Relative command in cron job", file,
+                                "Token '%.100s' (job runs as %s) is relative or not a "
+                                "recognized wrapper; not inspected for writability.",
+                                tok, cmd_user);
+                else
+                    add_finding(fl, "cron.unparsed_token", CAT_CRON, SEV_LOW, CONF_POSSIBLE,
+                                "Relative command in cron job", file,
+                                "Token '%.100s' is relative or not a recognized "
+                                "wrapper; not inspected for writability.", tok);
+            }
+            command_position = false;
             continue;
         }
 
+        command_position = false;
         struct stat st;
         if (stat(tok, &st) != 0) continue; /* dangling path, not our concern here */
         if (!S_ISREG(st.st_mode)) continue;
@@ -992,7 +1241,7 @@ static void inspect_cron_entry(FindingList *fl, const Options *o, const char *fi
                 if (ilen >= sizeof(inner)) ilen = sizeof(inner) - 1;
                 memcpy(inner, q, ilen);
                 inner[ilen] = '\0';
-                inspect_token_list(fl, o, file, cmd_user, inner);
+                inspect_token_list(fl, o, file, cmd_user, inner, true);
                 return;
             }
         }
@@ -1000,7 +1249,7 @@ static void inspect_cron_entry(FindingList *fl, const Options *o, const char *fi
 
     char cmdcopy[2048];
     snprintf(cmdcopy, sizeof(cmdcopy), "%s", cmdstart);
-    inspect_token_list(fl, o, file, cmd_user, cmdcopy);
+    inspect_token_list(fl, o, file, cmd_user, cmdcopy, true);
 }
 
 static void scan_cron_crontab_file(FindingList *fl, const Options *o, const char *path,
@@ -1019,7 +1268,8 @@ static void scan_cron_crontab_file(FindingList *fl, const Options *o, const char
 
 /* cron.hourly/daily/weekly/monthly entries are executable scripts, not
  * crontab-format lines - scan their content for absolute writable refs only,
- * without trying to parse schedule/user fields that don't exist there. */
+ * without trying to parse schedule/user fields that don't exist there (and
+ * without flagging shell syntax as a "relative command"). */
 static void inspect_script_for_writable_refs(FindingList *fl, const Options *o, const char *path) {
     FILE *fp = fopen(path, "r");
     if (!fp) return;
@@ -1029,7 +1279,7 @@ static void inspect_script_for_writable_refs(FindingList *fl, const Options *o, 
         if (*s == '\0' || *s == '#') continue;
         char copy[2048];
         snprintf(copy, sizeof(copy), "%s", s);
-        inspect_token_list(fl, o, path, NULL, copy);
+        inspect_token_list(fl, o, path, NULL, copy, false);
     }
     fclose(fp);
 }
@@ -1050,6 +1300,17 @@ static void report_writable_cron_path(FindingList *fl, const Options *o,
 
 static void scan_cron(FindingList *fl, const Options *o, ScanStats *stats) {
     scan_cron_crontab_file(fl, o, "/etc/crontab", /*has_user_field=*/true, stats);
+
+    /* The system crontab itself is the highest-value cron target and was the
+     * one file in this scan never checked for writability (only the files
+     * inside the cron directories were). */
+    if (is_writable_by_me("/etc/crontab"))
+        report_writable_cron_path(fl, o, "Writable /etc/crontab",
+                                  "Writable /etc/crontab (root auditor)",
+                                  "cron.crontab_writable", "cron.crontab_writable_root_auditor",
+                                  "/etc/crontab",
+                                  "/etc/crontab is writable by the current user; root "
+                                  "scheduled commands could be added or replaced.");
 
     static const struct { const char *dir; bool has_user_field; bool is_script_dir; } dirs[] = {
         { "/etc/cron.d",            true,  false },
@@ -1650,13 +1911,22 @@ static void report_text(const FindingList *fl, const Options *o, const ScanStats
     int counts[SEV_COUNT];
     count_by_severity(fl, o, counts);
 
+    /* count_by_severity() already excludes INFO unless --verbose, so the sum
+     * is exactly the number of findings printed below. Counting fl->count
+     * here made the header disagree with its own severity breakdown and with
+     * the list whenever INFO items were suppressed. */
+    int visible = counts[SEV_CRITICAL] + counts[SEV_HIGH] + counts[SEV_MEDIUM] +
+                  counts[SEV_LOW] + counts[SEV_INFO];
+    int actionable = counts[SEV_CRITICAL] + counts[SEV_HIGH] + counts[SEV_MEDIUM] +
+                     counts[SEV_LOW];
+
     for (int i = 0; i < nran; i++)
         printf("[+] %s\n", ran[i]);
     printf("\n");
 
     print_coverage_text(stats);
 
-    printf("Findings: %zu\n", fl->count);
+    printf("Findings: %d\n", visible);
     printf("Critical: %d\n", counts[SEV_CRITICAL]);
     printf("High:     %d\n", counts[SEV_HIGH]);
     printf("Medium:   %d\n", counts[SEV_MEDIUM]);
@@ -1685,9 +1955,7 @@ static void report_text(const FindingList *fl, const Options *o, const ScanStats
         printf("\n");
     }
 
-    if (fl->count == 0 ||
-        (!o->verbose && counts[SEV_CRITICAL] + counts[SEV_HIGH] +
-                            counts[SEV_MEDIUM] + counts[SEV_LOW] == 0)) {
+    if (actionable == 0) {
         printf("No actionable findings at the selected verbosity.\n");
         if (!o->verbose)
             printf("(Re-run with --verbose to include INFO findings.)\n");
@@ -1725,6 +1993,12 @@ static void report_json(const FindingList *fl, const Options *o, const HostInfo 
     count_by_severity(fl, o, counts);
     bool partial = (stats->roots_unreadable > 0) || (stats->paths_skipped_unreadable > 0);
 
+    /* Number of findings actually written to the array below; total must match
+     * it, otherwise `total` disagrees with `findings | length` and with the
+     * severity breakdown whenever INFO items are suppressed. */
+    size_t visible = (size_t)(counts[SEV_CRITICAL] + counts[SEV_HIGH] +
+                              counts[SEV_MEDIUM] + counts[SEV_LOW] + counts[SEV_INFO]);
+
     printf("{\n");
     printf("  \"tool\": \"%s\",\n", TOOL_NAME);
     printf("  \"version\": \"%s\",\n", TOOL_VERSION);
@@ -1742,7 +2016,7 @@ static void report_json(const FindingList *fl, const Options *o, const HostInfo 
     printf("    \"roots_missing_expected\": %d\n", stats->roots_missing_expected);
     printf("  },\n");
     printf("  \"summary\": {\n");
-    printf("    \"total\": %zu,\n", fl->count);
+    printf("    \"total\": %zu,\n", visible);
     printf("    \"critical\": %d,\n", counts[SEV_CRITICAL]);
     printf("    \"high\": %d,\n", counts[SEV_HIGH]);
     printf("    \"medium\": %d,\n", counts[SEV_MEDIUM]);
@@ -1752,11 +2026,7 @@ static void report_json(const FindingList *fl, const Options *o, const HostInfo 
     printf("  \"findings\": [\n");
 
     /* fixes.md item 12: --verbose/INFO filtering must behave the same in
-     * JSON as in text, so count visible items up front for correct commas. */
-    size_t visible = 0;
-    for (size_t i = 0; i < fl->count; i++)
-        if (o->verbose || fl->items[i].severity != SEV_INFO) visible++;
-
+     * JSON as in text; the comma logic uses the count computed above. */
     size_t emitted = 0;
     for (size_t i = 0; i < fl->count; i++) {
         const Finding *f = &fl->items[i];

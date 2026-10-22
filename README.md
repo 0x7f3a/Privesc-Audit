@@ -24,9 +24,11 @@ ranked by severity, so a human can focus on verification and remediation.
 - Reads Linux file **capabilities** and flags dangerous ones (e.g.
   `cap_setuid`, `cap_sys_admin`).
 - Reviews `sudoers` policy for `NOPASSWD`, `!authenticate`, and risky
-  `env_keep` entries.
+  `env_keep` entries, follows `#include`/`@include`/`#includedir` directives,
+  and flags writable policy files and directories (including drop-ins under
+  `/etc/sudoers.d`).
 - Reviews cron locations for writable job files, writable job directories, and
-  writable scripts referenced by jobs.
+  writable scripts referenced by jobs, plus `/etc/crontab` itself.
 - Reviews systemd units for writable unit files and writable `ExecStart`
   targets.
 - Inspects running root processes for writable backing executables.
@@ -130,7 +132,7 @@ informational note.
 
 | Level      | Meaning                                                              |
 | ---------- | ------------------------------------------------------------------- |
-| `CRITICAL` | Direct, high-confidence escalation primitive (e.g. writable SUID root binary, writable `/etc/sudoers` or `/etc/passwd`). |
+| `CRITICAL` | Direct, high-confidence escalation primitive (e.g. writable SUID root binary, writable sudoers policy file or drop-in directory, writable `/etc/passwd`). |
 | `HIGH`     | Strong escalation path likely (writable cron/service target, dangerous capability, writable `$PATH`). |
 | `MEDIUM`   | Notable misconfiguration worth investigating (non-baseline SUID, passwordless sudo rule, missing sticky bit). |
 | `LOW`      | Minor hygiene issue.                                                 |
@@ -257,8 +259,8 @@ JSON output (`--json`) mirrors the same data as a single object with `host`,
 
 ## Limitations
 
-- Baseline lists (expected SUID binaries, "risky" binaries) are small and
-  curated, not exhaustive; tune them for your environment.
+- Baseline lists (expected SUID and SGID binaries, "risky" binaries) are
+  small and curated, not exhaustive; tune them for your environment.
 - Capability and `/proc` process scans are Linux-only.
 - No parsing of LD/loader configs, NFS `no_root_squash`, container/namespace
   escapes, kernel module signing, or SELinux/AppArmor posture — the tool covers

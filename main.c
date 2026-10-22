@@ -192,6 +192,29 @@ static void fl_free(FindingList *fl) {
 static void add_finding(FindingList *fl, const char *check_id, Category cat,
                         Severity sev, Confidence conf, const char *title,
                         const char *path, const char *detail_fmt, ...) {
+    /* Format the detail first so an exact duplicate can be recognised and
+     * dropped. Several scanners legitimately reach the same conclusion more
+     * than once (e.g. the four identical `run-parts` jobs in a stock
+     * /etc/crontab, or two lines of the same cron.d file); repeating an
+     * identical finding adds no information and inflates the counts. */
+    char detail[1024] = "";
+    if (detail_fmt) {
+        va_list ap;
+        va_start(ap, detail_fmt);
+        vsnprintf(detail, sizeof(detail), detail_fmt, ap);
+        va_end(ap);
+    }
+
+    const char *id = check_id ? check_id : "unspecified";
+    const char *p  = path ? path : "";
+    for (size_t i = 0; i < fl->count; i++) {
+        const Finding *e = &fl->items[i];
+        if (e->category == cat && e->severity == sev &&
+            strcmp(e->check_id, id) == 0 && strcmp(e->path, p) == 0 &&
+            strcmp(e->detail, detail) == 0)
+            return;
+    }
+
     if (fl->count == fl->cap) {
         size_t ncap = fl->cap ? fl->cap * 2 : 32;
         Finding *tmp = realloc(fl->items, ncap * sizeof(*tmp));
@@ -208,18 +231,10 @@ static void add_finding(FindingList *fl, const char *check_id, Category cat,
     f->severity = sev;
     f->confidence = conf;
 
-    snprintf(f->check_id, sizeof(f->check_id), "%s", check_id ? check_id : "unspecified");
+    snprintf(f->check_id, sizeof(f->check_id), "%s", id);
     snprintf(f->title, sizeof(f->title), "%s", title ? title : "");
-    snprintf(f->path, sizeof(f->path), "%s", path ? path : "");
-
-    if (detail_fmt) {
-        va_list ap;
-        va_start(ap, detail_fmt);
-        vsnprintf(f->detail, sizeof(f->detail), detail_fmt, ap);
-        va_end(ap);
-    } else {
-        f->detail[0] = '\0';
-    }
+    snprintf(f->path, sizeof(f->path), "%s", p);
+    snprintf(f->detail, sizeof(f->detail), "%s", detail);
 }
 
 /* ========================================================================
@@ -458,6 +473,34 @@ static const char *known_suid[] = {
     "/usr/bin/fusermount3", "/bin/fusermount3",
     "/usr/lib/openssh/ssh-keysign",
     "/usr/bin/ping", "/bin/ping",
+    /* Other stock Debian/Ubuntu/Kali setuid-root helpers. These are shipped
+     * SUID by their packages (mount helpers, pppd, the Xorg wrapper, the
+     * polkit agent helper, Chromium's sandbox, the Kismet capture helpers and
+     * the rsh-redone clients); reporting each of them as a MEDIUM "non-standard
+     * SUID" on every stock Kali host was baseline noise. Tune for your own
+     * environment - anything not listed here is still reported. */
+    "/usr/sbin/mount.nfs", "/sbin/mount.nfs",
+    "/usr/sbin/mount.cifs", "/sbin/mount.cifs",
+    "/usr/sbin/pppd", "/sbin/pppd",
+    "/usr/bin/ntfs-3g", "/bin/ntfs-3g",
+    "/usr/bin/vmware-user-suid-wrapper", "/bin/vmware-user-suid-wrapper",
+    "/usr/lib/chromium/chrome-sandbox",
+    "/usr/lib/xorg/Xorg.wrap",
+    "/usr/lib/polkit-1/polkit-agent-helper-1",
+    "/usr/libexec/polkit-agent-helper-1",
+    "/usr/bin/rsh-redone-rsh", "/bin/rsh-redone-rsh",
+    "/usr/bin/rsh-redone-rlogin", "/bin/rsh-redone-rlogin",
+    "/usr/bin/kismet_cap_linux_bluetooth", "/bin/kismet_cap_linux_bluetooth",
+    "/usr/bin/kismet_cap_rz_killerbee", "/bin/kismet_cap_rz_killerbee",
+    "/usr/bin/kismet_cap_nrf_52840", "/bin/kismet_cap_nrf_52840",
+    "/usr/bin/kismet_cap_ti_cc_2540", "/bin/kismet_cap_ti_cc_2540",
+    "/usr/bin/kismet_cap_hak5_wifi_coconut", "/bin/kismet_cap_hak5_wifi_coconut",
+    "/usr/bin/kismet_cap_nrf_mousejack", "/bin/kismet_cap_nrf_mousejack",
+    "/usr/bin/kismet_cap_nxp_kw41z", "/bin/kismet_cap_nxp_kw41z",
+    "/usr/bin/kismet_cap_nrf_51822", "/bin/kismet_cap_nrf_51822",
+    "/usr/bin/kismet_cap_ubertooth_one", "/bin/kismet_cap_ubertooth_one",
+    "/usr/bin/kismet_cap_linux_wifi", "/bin/kismet_cap_linux_wifi",
+    "/usr/bin/kismet_cap_ti_cc_2531", "/bin/kismet_cap_ti_cc_2531",
     NULL
 };
 
@@ -500,6 +543,8 @@ static const char *known_sgid[] = {
     "/usr/bin/crontab", "/bin/crontab",
     "/usr/bin/locate", "/bin/locate",
     "/usr/bin/mlocate", "/bin/mlocate",
+    "/usr/bin/plocate", "/bin/plocate",
+    "/usr/lib/xorg/Xorg.wrap",
     "/usr/bin/ssh-agent", "/bin/ssh-agent",
     "/usr/bin/screen", "/bin/screen",
     "/usr/sbin/unix_chkpwd", "/sbin/unix_chkpwd",
@@ -1041,7 +1086,14 @@ static const char *cron_wrappers[] = {
  * actually look like an unresolved command. */
 static bool is_shell_noise_token(const char *tok) {
     static const char *noise[] = {
-        "test", "[", "]", "&&", "||", ";", "|", "then", "fi", "do", "done", NULL
+        "test", "[", "]", "&&", "||", ";", "|",
+        "then", "fi", "do", "done",
+        /* Structural shell keywords: a cron job may legitimately start a
+         * command with one of these after `&&` (e.g. Debian's /etc/cron.d/php
+         * uses `[ -x ... ] && if [ ! -d ... ]; then ...`), so they are syntax,
+         * not a command that PATH could resolve. */
+        "if", "elif", "else", "while", "until", "for", "case", "esac",
+        "{", "}", "in", "select", NULL
     };
     if (tok[0] == '-') return true; /* flag, e.g. -e, -f, -c */
     for (int i = 0; noise[i]; i++)
@@ -1840,7 +1892,10 @@ static void scan_package(FindingList *fl, const HostInfo *h, const Options *o) {
     struct stat st;
     if (stat("/usr/bin/pkexec", &st) == 0 && (st.st_mode & S_ISUID)) {
         char ver[128];
+        /* Debian renamed policykit-1 to polkitd; check both spellings (and
+         * the upstream name) so the version is known on current Kali/Ubuntu. */
         if (query_package_version("policykit-1", ver, sizeof(ver)) ||
+            query_package_version("polkitd", ver, sizeof(ver)) ||
             query_package_version("polkit", ver, sizeof(ver))) {
             add_finding(fl, "pkg.pwnkit_surface", CAT_PACKAGE, SEV_MEDIUM, CONF_POSSIBLE,
                         "pkexec present (PwnKit surface)", "/usr/bin/pkexec",

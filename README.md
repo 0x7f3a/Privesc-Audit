@@ -151,7 +151,7 @@ with `_WIN32`; selecting a category that only exists on the other platform with
 | -------------- | -------- | ----------------------------------------------------------- |
 | `system`       | both     | User, ids/elevation, distro or OS build, kernel, architecture. |
 | `suid`         | Linux    | SUID/SGID binaries; writable / known-risky / non-baseline.  |
-| `capabilities` | Linux    | File capabilities via `security.capability` xattr.          |
+| `capabilities` | Linux    | File capabilities via `security.capability` xattr; every capability found is listed, risky ones with severity. |
 | `sudo`         | Linux    | `/etc/sudoers`, includes and drop-ins; writable policy.     |
 | `cron`         | Linux    | System crontab, `cron.d`/`cron.*`, spool dirs, writable targets. |
 | `services`     | both     | Linux: systemd units and `ExecStart`. Windows: unquoted paths, writable images/dirs. |
@@ -223,12 +223,16 @@ Always confirm manually before acting on a finding.
   crontabs, root-only unit directories); those are silently skipped, so a run
   as root will naturally surface more.
 - The tool never requests or needs elevated privileges to do its work.
-- **Windows:** permissions are evaluated with `AccessCheck` against each
-  object's DACL using the current token, so nothing is opened for writing. Run
-  it from a normal (non-elevated) prompt to see what a standard user could do;
-  running elevated sets the same "privileged auditor" mode as root on POSIX,
-  downgrading self-caused readability/writability findings to INFO so they
-  don't masquerade as escalation paths.
+- **Windows:** permissions are evaluated against each object's DACL with
+  `AccessCheck` using an impersonation duplicate of the current token, so
+  nothing is opened for writing. If `AccessCheck` cannot answer, the DACL is
+  evaluated directly (deny ACEs first, then allow ACEs for the token's user and
+  groups); whatever still cannot be decided is reported as `perm.unevaluated`
+  instead of being counted as "not writable". Run it from a normal
+  (non-elevated) prompt to see what a standard user could do; running elevated
+  sets the same "privileged auditor" mode as root on POSIX, downgrading
+  self-caused readability/writability findings to INFO so they don't masquerade
+  as escalation paths.
 
 ## Security considerations
 
@@ -297,6 +301,7 @@ NOTE: Findings are audit results requiring human verification, not proof of expl
 
 JSON output (`--json`) mirrors the same data as a single object with `host`,
 `summary`, and a `findings` array — suitable for piping into `jq` or a pipeline.
+`host.uid` is `null` on Windows, where a uid would be meaningless.
 
 ## Limitations
 
@@ -324,3 +329,8 @@ JSON output (`--json`) mirrors the same data as a single object with `host`,
 - Machine-wide `Run` keys and the all-users Startup folder are judged by their
   DACL; the per-user Startup folder is reported as LOW because being writable
   by its owner is normal.
+- `Run` values and service image paths are resolved to the executable they
+  actually name, including unquoted paths containing spaces; the hijack
+  candidates (`C:\Program.exe`, ...) are only used to judge the ambiguity.
+- A run that reports `perm.unevaluated` could not decide some objects' DACLs;
+  treat its writability results as incomplete rather than clean.

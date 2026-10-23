@@ -71,7 +71,7 @@
  * ==================================================================== */
 
 #define TOOL_NAME    "privesc-auditor"
-#define TOOL_VERSION "2.0.0"  /* 2.0: Windows port */
+#define TOOL_VERSION "2.0.1"  /* 2.0: Windows port; 2.0.1: real ACL verdicts */
 
 #ifdef _WIN32
 #define TOOL_PLATFORM "windows"
@@ -325,9 +325,15 @@ static inline bool win_path_is_quoted(const char *s) {
     return *s == '"';
 }
 
-/* The image path the loader tries first: the text inside the first pair of
- * quotes, or everything up to the first space when unquoted. */
-static inline bool win_exec_token(const char *cmd, char *out, size_t outsz) {
+/* The executable a service command line / Run value actually names.
+ *
+ * For a quoted image this is the text inside the quotes. For an unquoted one
+ * the loader's *first* attempt is only the text up to the first space
+ * ("C:\\Program" in `C:\\Program Files\\App\\svc.exe`), which does not
+ * exist; the file the service really runs is the whole path ending in .exe.
+ * Inspecting only the first token made every writable-image check examine a
+ * nonexistent path and silently report nothing. */
+static inline bool win_image_path(const char *cmd, char *out, size_t outsz) {
     if (outsz < 2) return false;
     out[0] = '\0';
     while (*cmd == ' ' || *cmd == '\t') cmd++;
@@ -339,11 +345,35 @@ static inline bool win_exec_token(const char *cmd, char *out, size_t outsz) {
             if (n + 1 < outsz) out[n++] = *cmd;
             cmd++;
         }
-    } else {
-        while (*cmd && *cmd != ' ' && *cmd != '\t') {
-            if (n + 1 < outsz) out[n++] = *cmd;
-            cmd++;
+        out[n] = '\0';
+        return n > 0;
+    }
+
+    /* Unquoted: up to the end of the first ".exe" that finishes a path
+     * component (end of string, space or tab). A directory named
+     * `foo.exe.d` does not end the image, and `svc.exe -k netsvcs` stops at
+     * the argument. */
+    const char *end = NULL;
+    for (const char *p = cmd; (p = str_ci_str(p, ".exe")) != NULL; p += 4) {
+        const char *after = p + 4;
+        if (*after == '\0' || *after == ' ' || *after == '\t') {
+            end = after;
+            break;
         }
+    }
+    if (end) {
+        size_t len = (size_t)(end - cmd);
+        while (len > 0 && (cmd[len - 1] == ' ' || cmd[len - 1] == '\t')) len--;
+        if (len >= outsz) len = outsz - 1;
+        memcpy(out, cmd, len);
+        out[len] = '\0';
+        return len > 0;
+    }
+
+    /* No extension in the command line at all: fall back to the first token. */
+    while (*cmd && *cmd != ' ' && *cmd != '\t') {
+        if (n + 1 < outsz) out[n++] = *cmd;
+        cmd++;
     }
     out[n] = '\0';
     return n > 0;
@@ -444,23 +474,171 @@ static char *win_utf8(const wchar_t *w) {
     return s;
 }
 
-/* Ask the token whether the object's DACL grants `access`. Never opens the
- * object, so the audit cannot modify or lock anything. */
-static bool win_access_check(PSECURITY_DESCRIPTOR sd, DWORD access,
+/* Objects whose DACL could not be evaluated. A check that could not run is
+ * not the same as "not writable", and reporting it as such would be a silent
+ * false negative, so the count is surfaced at the end of the scan. */
+static int win_acl_unverified = 0;
+
+/* AccessCheck() requires an *impersonation* token. Handing it the process's
+ * primary token fails with ERROR_NO_IMPERSONATION_TOKEN (1309) on every
+ * object, which made every writability verdict a silent "no". Duplicate the
+ * process token once and reuse the impersonation handle. */
+static HANDLE win_acl_token(void) {
+    static HANDLE cached = NULL;
+    static bool looked_up = false;
+    if (looked_up) return cached;
+    looked_up = true;
+
+    HANDLE primary = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &primary))
+        return NULL;
+
+    HANDLE imp = NULL;
+    if (!DuplicateTokenEx(primary, TOKEN_QUERY, NULL, SecurityImpersonation,
+                          TokenImpersonation, &imp))
+        imp = NULL;
+
+    CloseHandle(primary);
+    cached = imp;
+    return cached;
+}
+
+/* 1 = granted, 0 = denied, -1 = the call itself failed (unknown). */
+static int win_access_check3(PSECURITY_DESCRIPTOR sd, DWORD access,
                              GENERIC_MAPPING *map) {
-    HANDLE tok = NULL;
-    bool granted_all = false;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    HANDLE tok = win_acl_token();
+    if (!tok) return -1;
 
     PRIVILEGE_SET privs;
     DWORD privsz = sizeof(privs);
     DWORD granted = 0;
     BOOL ok = FALSE;
-    if (AccessCheck(sd, tok, access, map, &privs, &privsz, &granted, &ok) && ok)
-        granted_all = true;
+    if (AccessCheck(sd, tok, access, map, &privs, &privsz, &granted, &ok))
+        return ok ? 1 : 0;
+    return -1;
+}
 
-    CloseHandle(tok);
-    return granted_all;
+/* SIDs held by the current process token (user first, then groups), cached for
+ * the lifetime of the run. Used only by the DACL fallback below. */
+static bool win_sid_is_mine(PSID sid) {
+    static bool init = false;
+    static PSID user_sid = NULL;
+    static TOKEN_GROUPS *groups = NULL;
+    static bool usable = false;
+
+    if (!init) {
+        init = true;
+        HANDLE tok = NULL;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+            DWORD len = 0;
+            GetTokenInformation(tok, TokenUser, NULL, 0, &len);
+            if (len) {
+                TOKEN_USER *tu = malloc(len);
+                if (tu && GetTokenInformation(tok, TokenUser, tu, len, &len)) {
+                    DWORD n = GetLengthSid(tu->User.Sid);
+                    user_sid = malloc(n);
+                    if (user_sid && CopySid(n, user_sid, tu->User.Sid)) usable = true;
+                }
+                free(tu);
+            }
+
+            len = 0;
+            GetTokenInformation(tok, TokenGroups, NULL, 0, &len);
+            if (len) {
+                TOKEN_GROUPS *tg = malloc(len);
+                if (tg && GetTokenInformation(tok, TokenGroups, tg, len, &len))
+                    groups = tg;
+                else
+                    free(tg);
+            }
+            CloseHandle(tok);
+        }
+    }
+
+    if (!usable) return false;
+    if (user_sid && EqualSid(sid, user_sid)) return true;
+    if (groups) {
+        for (DWORD i = 0; i < groups->GroupCount; i++) {
+            if (groups->Groups[i].Attributes & SE_GROUP_USE_FOR_DENY_ONLY) continue;
+            if (EqualSid(sid, groups->Groups[i].Sid)) return true;
+        }
+    }
+    return false;
+}
+
+/* Evaluate the DACL directly (deny ACEs first, then allow ACEs), the way the
+ * kernel would. This is the fallback for hosts where AccessCheck itself fails
+ * - without it, every permission verdict on such a host would silently be
+ * "not writable". */
+static int win_dacl_decide(PSECURITY_DESCRIPTOR sd, PACL dacl, DWORD access,
+                           GENERIC_MAPPING *map) {
+    (void)sd;
+    if (!dacl) return 1; /* NULL DACL: full control for everyone */
+
+    ACL_SIZE_INFORMATION si;
+    if (!GetAclInformation(dacl, &si, sizeof(si), AclSizeInformation)) return -1;
+
+    DWORD allow = 0, deny = 0;
+    for (DWORD i = 0; i < si.AceCount; i++) {
+        LPVOID ace = NULL;
+        if (!GetAce(dacl, i, &ace) || !ace) return -1;
+        ACE_HEADER *h = ace;
+
+        DWORD mask;
+        PSID sid;
+        if (h->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+            ACCESS_ALLOWED_ACE *a = ace;
+            mask = a->Mask;
+            sid = (PSID)&a->SidStart;
+        } else if (h->AceType == ACCESS_DENIED_ACE_TYPE) {
+            ACCESS_DENIED_ACE *d = ace;
+            mask = d->Mask;
+            sid = (PSID)&d->SidStart;
+        } else {
+            /* Object ACEs carry a SID in a variable-length tail; skip them
+             * rather than mis-read the mask. */
+            continue;
+        }
+        if (!IsValidSid(sid) || !win_sid_is_mine(sid)) continue;
+
+        /* Expand generic rights carried inside the ACE. */
+        DWORD m = mask & ~(GENERIC_ALL | GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE);
+        if (mask & GENERIC_ALL) m |= map->GenericAll;
+        if (mask & GENERIC_READ) m |= map->GenericRead;
+        if (mask & GENERIC_WRITE) m |= map->GenericWrite;
+        if (mask & GENERIC_EXECUTE) m |= map->GenericExecute;
+
+        if (h->AceType == ACCESS_ALLOWED_ACE_TYPE) allow |= m;
+        else deny |= m;
+    }
+
+    if (access & deny) return 0;
+    return ((access & allow) == access) ? 1 : 0;
+}
+
+/* Final answer for one object: kernel check first, DACL arithmetic second.
+ * Anything that could not be decided is counted, never reported as "no". */
+static bool win_effective_write(PSECURITY_DESCRIPTOR sd, PACL dacl, DWORD access,
+                                GENERIC_MAPPING *map) {
+    int verdict = win_access_check3(sd, access, map);
+    if (verdict < 0) verdict = win_dacl_decide(sd, dacl, access, map);
+    if (verdict < 0) {
+        win_acl_unverified++;
+        return false;
+    }
+    return verdict == 1;
+}
+
+/* One INFO line so a run where permissions could not be evaluated never looks
+ * like a run where everything was simply not writable. */
+static void win_report_acl_gaps(FindingList *fl) {
+    if (win_acl_unverified <= 0) return;
+    add_finding(fl, "perm.unevaluated", CAT_FILESYSTEM, SEV_INFO, CONF_CONFIRMED,
+                "Permission checks that could not be evaluated", NULL,
+                "%d DACL check(s) failed (AccessCheck/DuplicateTokenEx), so those "
+                "objects are reported as not writable without evidence. Treat "
+                "writability findings on this host as incomplete.",
+                win_acl_unverified);
 }
 
 /* Effective write access to a file or directory. */
@@ -471,18 +649,17 @@ static bool is_writable_by_me(const char *path) {
     bool writable = false;
     PACL dacl = NULL;
     PSECURITY_DESCRIPTOR sd = NULL;
-    if (GetNamedSecurityInfoW(wpath, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
-                              NULL, NULL, &dacl, NULL, &sd) == ERROR_SUCCESS) {
-        if (!dacl) {
-            writable = true; /* NULL DACL means everyone has full control */
-        } else {
-            GENERIC_MAPPING map;
-            map.GenericRead = FILE_GENERIC_READ;
-            map.GenericWrite = FILE_GENERIC_WRITE;
-            map.GenericExecute = FILE_GENERIC_EXECUTE;
-            map.GenericAll = FILE_ALL_ACCESS;
-            writable = win_access_check(sd, FILE_GENERIC_WRITE, &map);
-        }
+    DWORD rc = GetNamedSecurityInfoW(wpath, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                     NULL, NULL, &dacl, NULL, &sd);
+    if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND && rc != ERROR_PATH_NOT_FOUND)
+        win_acl_unverified++; /* exists but unreadable, or the query failed */
+    if (rc == ERROR_SUCCESS) {
+        GENERIC_MAPPING map;
+        map.GenericRead = FILE_GENERIC_READ;
+        map.GenericWrite = FILE_GENERIC_WRITE;
+        map.GenericExecute = FILE_GENERIC_EXECUTE;
+        map.GenericAll = FILE_ALL_ACCESS;
+        writable = win_effective_write(sd, dacl, FILE_GENERIC_WRITE, &map);
         LocalFree(sd);
     }
     free(wpath);
@@ -506,16 +683,12 @@ static bool win_reg_write_allowed(HKEY root, const char *subkey) {
     PSECURITY_DESCRIPTOR sd = NULL;
     if (GetNamedSecurityInfoW(full, SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION,
                               NULL, NULL, &dacl, NULL, &sd) == ERROR_SUCCESS) {
-        if (!dacl) {
-            writable = true;
-        } else {
-            GENERIC_MAPPING map;
-            map.GenericRead = KEY_READ;
-            map.GenericWrite = KEY_WRITE;
-            map.GenericExecute = KEY_EXECUTE;
-            map.GenericAll = KEY_ALL_ACCESS;
-            writable = win_access_check(sd, KEY_SET_VALUE, &map);
-        }
+        GENERIC_MAPPING map;
+        map.GenericRead = KEY_READ;
+        map.GenericWrite = KEY_WRITE;
+        map.GenericExecute = KEY_EXECUTE;
+        map.GenericAll = KEY_ALL_ACCESS;
+        writable = win_effective_write(sd, dacl, KEY_SET_VALUE, &map);
         LocalFree(sd);
     }
     return writable;
@@ -1261,7 +1434,28 @@ static const struct { int bit; const char *name; Severity sev; } cap_table[] = {
     { -1, NULL,                   SEV_INFO     }
 };
 
-typedef struct { FindingList *fl; } CapCtx;
+/* Readable names for every capability bit that appears in practice, so a file
+ * carrying capabilities the high-risk table does not list is still reported
+ * instead of producing silence. */
+static const char *cap_bit_name(int bit) {
+    static const char *names[] = {
+        "cap_chown", "cap_dac_override", "cap_dac_read_search", "cap_fowner",
+        "cap_fsetid", "cap_kill", "cap_setgid", "cap_setuid", "cap_setpcap",
+        "cap_linux_immutable", "cap_net_bind_service", "cap_net_broadcast",
+        "cap_net_admin", "cap_net_raw", "cap_ipc_lock", "cap_ipc_owner",
+        "cap_sys_module", "cap_sys_rawio", "cap_sys_chroot", "cap_sys_ptrace",
+        "cap_sys_pacct", "cap_sys_admin", "cap_sys_boot", "cap_sys_nice",
+        "cap_sys_resource", "cap_sys_time", "cap_sys_tty_config", "cap_mknod",
+        "cap_lease", "cap_audit_write", "cap_audit_control", "cap_setfcap",
+        "cap_mac_override", "cap_mac_admin", "cap_syslog", "cap_wake_alarm",
+        "cap_block_suspend", "cap_audit_read", "cap_perfmon", "cap_bpf",
+        "cap_checkpoint_restore"
+    };
+    if (bit < 0 || bit >= (int)(sizeof(names) / sizeof(names[0]))) return NULL;
+    return names[bit];
+}
+
+typedef struct { FindingList *fl; int files; } CapCtx;
 
 static void cap_cb(const char *path, const struct stat *st, void *vctx) {
     (void)st;
@@ -1281,6 +1475,29 @@ static void cap_cb(const char *path, const struct stat *st, void *vctx) {
         permitted |= ((unsigned long long)(buf[12] | (buf[13] << 8) |
                       (buf[14] << 16) | ((unsigned)buf[15] << 24))) << 32;
     }
+
+    c->files++;
+
+    /* Always describe what the file actually carries. Without this a host whose
+     * only capabilities are, say, cap_net_raw produced an empty capability
+     * section, which reads as "nothing found" rather than "nothing risky". */
+    char present[512];
+    size_t used = 0;
+    present[0] = '\0';
+    for (int bit = 0; bit < 41 && used + 1 < sizeof(present); bit++) {
+        if (!(permitted & (1ULL << bit))) continue;
+        const char *nm = cap_bit_name(bit);
+        char tmp[48];
+        if (nm) snprintf(tmp, sizeof(tmp), "%s%s", used ? ", " : "", nm);
+        else snprintf(tmp, sizeof(tmp), "%scap_bit_%d", used ? ", " : "", bit);
+        size_t add = strlen(tmp);
+        if (used + add + 1 >= sizeof(present)) break;
+        memcpy(present + used, tmp, add + 1);
+        used += add;
+    }
+    add_finding(c->fl, "cap.present", CAT_CAPABILITIES, SEV_INFO, CONF_CONFIRMED,
+                "File capability set (informational)", path,
+                "Binary carries %s in its permitted set.", present[0] ? present : "capabilities");
 
     for (int i = 0; cap_table[i].name; i++) {
         if (permitted & (1ULL << cap_table[i].bit)) {
@@ -1304,12 +1521,16 @@ static void scan_capabilities(FindingList *fl, const Options *o, ScanStats *stat
         "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin",
         "/usr/local/sbin", "/opt", NULL
     };
-    CapCtx ctx = { fl };
+    CapCtx ctx = { fl, 0 };
     SeenSet seen;
     seen_set_init(&seen);
     for (int i = 0; roots[i]; i++)
         walk_dir(roots[i], 0, 4, cap_cb, &ctx, &seen, stats, true);
     seen_set_free(&seen);
+
+    add_finding(fl, "cap.enumerated", CAT_CAPABILITIES, SEV_INFO, CONF_CONFIRMED,
+                "Files with capabilities enumerated", NULL,
+                "%d file(s) with a security.capability attribute inspected.", ctx.files);
 #else
     add_finding(fl, "cap.unavailable", CAT_CAPABILITIES, SEV_INFO, CONF_CONFIRMED,
                 "Capability scan unavailable", NULL,
@@ -2449,7 +2670,7 @@ static void win_inspect_service(FindingList *fl, const Options *o, SC_HANDLE scm
     win_expand_env(raw, cmd, sizeof(cmd));
 
     char image[1024];
-    bool have_image = win_exec_token(cmd, image, sizeof(image));
+    bool have_image = win_image_path(cmd, image, sizeof(image));
     bool privileged = win_account_is_privileged(acct);
     const char *acct_label = (acct && *acct) ? acct : "LocalSystem";
     const char *shown = have_image ? image : cmd;
@@ -2652,7 +2873,7 @@ static void win_scan_run_key(FindingList *fl, const Options *o, HKEY root,
 
         char expanded[2048], image[1024];
         win_expand_env(cmd, expanded, sizeof(expanded));
-        if (win_exec_token(expanded, image, sizeof(image)) && is_writable_by_me(image)) {
+        if (win_image_path(expanded, image, sizeof(image)) && is_writable_by_me(image)) {
             if (o->is_root) {
                 add_finding(fl, "auto.run_target_writable_root_auditor", CAT_AUTOSTART,
                             SEV_INFO, CONF_CONFIRMED,
@@ -3101,7 +3322,12 @@ static void report_json(const FindingList *fl, const Options *o, const HostInfo 
     printf("    \"platform\": \"%s\",\n", h->platform);
     printf("    \"elevated\": %s,\n", h->elevated ? "true" : "false");
     printf("    \"user\": \""); json_escape(stdout, h->user); printf("\",\n");
+#ifdef _WIN32
+    /* Windows has no uid; printing 0 would read as "root". */
+    printf("    \"uid\": null,\n");
+#else
     printf("    \"uid\": %u,\n", (unsigned)h->uid);
+#endif
     printf("    \"distro\": \""); json_escape(stdout, h->distro); printf("\",\n");
     printf("    \"kernel\": \""); json_escape(stdout, h->kernel); printf("\",\n");
     printf("    \"arch\": \""); json_escape(stdout, h->arch); printf("\"\n");
@@ -3356,6 +3582,11 @@ int main(int argc, char **argv) {
                     "The '%s' scan is implemented in the %s build only.",
                     category_name((Category)c), other);
     }
+
+#ifdef _WIN32
+    /* A DACL check that could not run is not evidence of safety. */
+    win_report_acl_gaps(&fl);
+#endif
 
     sort_findings(&fl);
 

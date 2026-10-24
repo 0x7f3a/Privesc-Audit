@@ -1,0 +1,281 @@
+{
+  "tool": "privesc-auditor",
+  "version": "2.0.1",
+  "host": {
+    "platform": "linux",
+    "elevated": false,
+    "user": "fbe95235b8007cb879b16fd75e",
+    "uid": 244754939,
+    "distro": "Ubuntu 24.04.5 LTS",
+    "kernel": "Linux 6.1.102",
+    "arch": "x86_64"
+  },
+  "coverage": {
+    "partial": true,
+    "paths_skipped_unreadable": 2,
+    "roots_unreadable": 2,
+    "roots_missing_expected": 5
+  },
+  "summary": {
+    "total": 28,
+    "critical": 0,
+    "high": 1,
+    "medium": 0,
+    "low": 0,
+    "info": 27
+  },
+  "findings": [
+    {
+      "check_id": "fs.path_writable",
+      "severity": "HIGH",
+      "confidence": "CONFIRMED",
+      "category": "filesystem",
+      "title": "Writable directory in $PATH",
+      "path": "/workspace/homes/e95235b8007cb879b16fd75e/.local/bin",
+      "detail": "A writable PATH dir allows planting trojan binaries."
+    },
+    {
+      "check_id": "sys.profile",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "system",
+      "title": "System profile",
+      "path": "",
+      "detail": "user=fbe95235b8007cb879b16fd75e uid=244754939 gid=1001 distro=Ubuntu 24.04.5 LTS kernel=Linux 6.1.102 arch=x86_64"
+    },
+    {
+      "check_id": "suid.sgid_baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SGID binary",
+      "path": "/bin/chage",
+      "detail": "SGID binary (group gid=42) on the expected baseline list."
+    },
+    {
+      "check_id": "suid.baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SUID binary",
+      "path": "/bin/chfn",
+      "detail": "SUID binary (uid=0), on the expected baseline list."
+    },
+    {
+      "check_id": "suid.baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SUID binary",
+      "path": "/bin/chsh",
+      "detail": "SUID binary (uid=0), on the expected baseline list."
+    },
+    {
+      "check_id": "suid.sgid_baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SGID binary",
+      "path": "/bin/expiry",
+      "detail": "SGID binary (group gid=42) on the expected baseline list."
+    },
+    {
+      "check_id": "suid.baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SUID binary",
+      "path": "/bin/gpasswd",
+      "detail": "SUID binary (uid=0), on the expected baseline list."
+    },
+    {
+      "check_id": "suid.baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SUID binary",
+      "path": "/bin/mount",
+      "detail": "SUID binary (uid=0), on the expected baseline list."
+    },
+    {
+      "check_id": "suid.baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SUID binary",
+      "path": "/bin/newgrp",
+      "detail": "SUID binary (uid=0), on the expected baseline list."
+    },
+    {
+      "check_id": "suid.baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SUID binary",
+      "path": "/bin/passwd",
+      "detail": "SUID binary (uid=0), on the expected baseline list."
+    },
+    {
+      "check_id": "suid.sgid_baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SGID binary",
+      "path": "/bin/ssh-agent",
+      "detail": "SGID binary (group gid=101) on the expected baseline list."
+    },
+    {
+      "check_id": "suid.baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SUID binary",
+      "path": "/bin/su",
+      "detail": "SUID binary (uid=0), on the expected baseline list."
+    },
+    {
+      "check_id": "suid.baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SUID binary",
+      "path": "/bin/sudo",
+      "detail": "SUID binary (uid=0), on the expected baseline list."
+    },
+    {
+      "check_id": "suid.baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SUID binary",
+      "path": "/bin/umount",
+      "detail": "SUID binary (uid=0), on the expected baseline list."
+    },
+    {
+      "check_id": "suid.sgid_baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SGID binary",
+      "path": "/sbin/pam_extrausers_chkpwd",
+      "detail": "SGID binary (group gid=42) on the expected baseline list."
+    },
+    {
+      "check_id": "suid.sgid_baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SGID binary",
+      "path": "/sbin/unix_chkpwd",
+      "detail": "SGID binary (group gid=42) on the expected baseline list."
+    },
+    {
+      "check_id": "suid.baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SUID binary",
+      "path": "/usr/lib/openssh/ssh-keysign",
+      "detail": "SUID binary (uid=0), on the expected baseline list."
+    },
+    {
+      "check_id": "suid.sgid_baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SGID binary",
+      "path": "/usr/lib/x86_64-linux-gnu/utempter/utempter",
+      "detail": "SGID binary (group gid=43) on the expected baseline list."
+    },
+    {
+      "check_id": "suid.baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SUID binary",
+      "path": "/usr/lib/dbus-1.0/dbus-daemon-launch-helper",
+      "detail": "SUID binary (uid=0), on the expected baseline list."
+    },
+    {
+      "check_id": "cap.present",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "capabilities",
+      "title": "File capability set (informational)",
+      "path": "/bin/arping",
+      "detail": "Binary carries cap_net_raw in its permitted set."
+    },
+    {
+      "check_id": "cap.present",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "capabilities",
+      "title": "File capability set (informational)",
+      "path": "/bin/mtr-packet",
+      "detail": "Binary carries cap_net_raw in its permitted set."
+    },
+    {
+      "check_id": "cap.present",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "capabilities",
+      "title": "File capability set (informational)",
+      "path": "/bin/ping",
+      "detail": "Binary carries cap_net_raw in its permitted set."
+    },
+    {
+      "check_id": "cap.enumerated",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "capabilities",
+      "title": "Files with capabilities enumerated",
+      "path": "",
+      "detail": "3 file(s) with a security.capability attribute inspected."
+    },
+    {
+      "check_id": "sudo.sudoers_unreadable",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "sudo",
+      "title": "/etc/sudoers unreadable",
+      "path": "/etc/sudoers",
+      "detail": "Direct read failed (errno=13: Permission denied). This is expected for a non-root user."
+    },
+    {
+      "check_id": "sudo.fallback_available",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "sudo",
+      "title": "sudo -n -l fallback available but disabled",
+      "path": "",
+      "detail": "Re-run with --sudo-fallback to attempt 'sudo -n -l' as a read fallback (opt-in: shells out to sudo, see --help)."
+    },
+    {
+      "check_id": "proc.coverage_limitation",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "processes",
+      "title": "Process scan coverage limitation",
+      "path": "",
+      "detail": "/proc/<pid>/exe is only readable for the invoking user's own processes, or for all processes if this audit itself runs as root. As a non-root user this scan is blind to most other users' and root's processes."
+    },
+    {
+      "check_id": "platform.not_applicable",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "autostart",
+      "title": "Scan not applicable on this platform",
+      "path": "",
+      "detail": "The 'autostart' scan is implemented in the Windows build only."
+    },
+    {
+      "check_id": "platform.not_applicable",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "privileges",
+      "title": "Scan not applicable on this platform",
+      "path": "",
+      "detail": "The 'privileges' scan is implemented in the Windows build only."
+    }
+  ]
+}

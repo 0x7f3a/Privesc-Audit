@@ -79,6 +79,17 @@ Linux/macOS, the Win32 API on Windows. Copy `main.c` to the target and compile
 git clone <your-repo> privesc-auditor && cd privesc-auditor
 ```
 
+## Repository layout
+
+| Path              | What it is                                                     |
+| ----------------- | -------------------------------------------------------------- |
+| `main.c`          | The whole tool, Linux and Windows, in one portable C11 file.   |
+| `Makefile`        | Build targets: `all`, `san`, `win`, `test`, `clean`.           |
+| `docs/checks.md`  | Every check id the tool can emit, generated from `main.c`.     |
+| `examples/`       | Real reports from a real run (text and JSON), unedited.        |
+| `tests/run.sh`    | End-to-end regression suite; `tests/check-docs.py` keeps the docs honest. |
+| `LICENSE`         | MIT.                                                            |
+
 ## Compilation
 
 Standard build (warnings-as-documentation, with compiler hardening):
@@ -160,6 +171,27 @@ with `_WIN32`; selecting a category that only exists on the other platform with
 | `package`      | Linux    | Kernel-version heuristic against a small built-in CVE table. |
 | `autostart`    | Windows  | `Run`/`RunOnce` keys, Startup folders, `AlwaysInstallElevated`. |
 | `privileges`   | Windows  | Dangerous token privileges, integrity level.                |
+
+## Testing
+
+```bash
+make test        # or: tests/run.sh
+```
+
+The suite builds the tool with `-Werror`, runs it against the current host
+and checks the result rather than a fixture:
+
+- JSON invariants (`summary.total` equals the finding count, severity counts
+  reconcile, exit code matches the worst severity);
+- no duplicated findings;
+- the SUID/SGID set the tool reports equals the one `find(1)` finds over the
+  same scan roots (compared by real path, so usr-merged `/bin` vs `/usr/bin`
+  does not matter);
+- `--check` runs only the selected category;
+- an ASan/UBSan run is clean;
+- `docs/checks.md` is in sync with `main.c` and covers every id the run emitted.
+
+It needs `cc` and `python3` and writes nothing outside a temporary directory.
 
 ## Severity levels
 
@@ -299,6 +331,10 @@ Potential privilege-escalation paths:
 NOTE: Findings are audit results requiring human verification, not proof of exploitability.
 ```
 
+Real, unedited reports from an actual run live in [`examples/`](examples/)
+(text and JSON from the same run), and [`docs/checks.md`](docs/checks.md)
+lists every check id the tool can emit.
+
 JSON output (`--json`) mirrors the same data as a single object with `host`,
 `summary`, and a `findings` array — suitable for piping into `jq` or a pipeline.
 `host.uid` is `null` on Windows, where a uid would be meaningless.
@@ -334,3 +370,7 @@ JSON output (`--json`) mirrors the same data as a single object with `host`,
   candidates (`C:\Program.exe`, ...) are only used to judge the ambiguity.
 - A run that reports `perm.unevaluated` could not decide some objects' DACLs;
   treat its writability results as incomplete rather than clean.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

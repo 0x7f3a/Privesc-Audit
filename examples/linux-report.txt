@@ -1,0 +1,224 @@
+========================================
+ Linux Privilege Escalation Auditor
+========================================
+
+User:   fbe95235b8007cb879b16fd75e
+UID:    244754939
+Distro: Ubuntu 24.04.5 LTS
+Kernel: Linux 6.1.102
+
+[+] System enumeration
+[+] SUID/SGID scan
+[+] Capability scan
+[+] Sudo scan
+[+] Cron scan
+[+] Service scan
+[+] Process scan
+[+] Filesystem scan
+[+] Package/CVE scan
+
+Scan coverage: PARTIAL
+  Paths skipped (unreadable mid-walk): 2
+  Scan roots unreadable (real failure): 2
+  Scan roots absent on this distro (expected): 5
+
+Findings: 28
+Critical: 0
+High:     1
+Medium:   0
+Low:      0
+Info:     27
+
+Potential privilege-escalation paths:
+
+[HIGH] Writable directory in $PATH
+  Check:      fs.path_writable
+  Category:   filesystem
+  Confidence: CONFIRMED
+  Path:       /workspace/homes/e95235b8007cb879b16fd75e/.local/bin
+  Detail:     A writable PATH dir allows planting trojan binaries.
+
+[INFO] System profile
+  Check:      sys.profile
+  Category:   system
+  Confidence: CONFIRMED
+  Detail:     user=fbe95235b8007cb879b16fd75e uid=244754939 gid=1001 distro=Ubuntu 24.04.5 LTS kernel=Linux 6.1.102 arch=x86_64
+
+[INFO] Standard SGID binary
+  Check:      suid.sgid_baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /bin/chage
+  Detail:     SGID binary (group gid=42) on the expected baseline list.
+
+[INFO] Standard SUID binary
+  Check:      suid.baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /bin/chfn
+  Detail:     SUID binary (uid=0), on the expected baseline list.
+
+[INFO] Standard SUID binary
+  Check:      suid.baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /bin/chsh
+  Detail:     SUID binary (uid=0), on the expected baseline list.
+
+[INFO] Standard SGID binary
+  Check:      suid.sgid_baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /bin/expiry
+  Detail:     SGID binary (group gid=42) on the expected baseline list.
+
+[INFO] Standard SUID binary
+  Check:      suid.baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /bin/gpasswd
+  Detail:     SUID binary (uid=0), on the expected baseline list.
+
+[INFO] Standard SUID binary
+  Check:      suid.baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /bin/mount
+  Detail:     SUID binary (uid=0), on the expected baseline list.
+
+[INFO] Standard SUID binary
+  Check:      suid.baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /bin/newgrp
+  Detail:     SUID binary (uid=0), on the expected baseline list.
+
+[INFO] Standard SUID binary
+  Check:      suid.baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /bin/passwd
+  Detail:     SUID binary (uid=0), on the expected baseline list.
+
+[INFO] Standard SGID binary
+  Check:      suid.sgid_baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /bin/ssh-agent
+  Detail:     SGID binary (group gid=101) on the expected baseline list.
+
+[INFO] Standard SUID binary
+  Check:      suid.baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /bin/su
+  Detail:     SUID binary (uid=0), on the expected baseline list.
+
+[INFO] Standard SUID binary
+  Check:      suid.baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /bin/sudo
+  Detail:     SUID binary (uid=0), on the expected baseline list.
+
+[INFO] Standard SUID binary
+  Check:      suid.baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /bin/umount
+  Detail:     SUID binary (uid=0), on the expected baseline list.
+
+[INFO] Standard SGID binary
+  Check:      suid.sgid_baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /sbin/pam_extrausers_chkpwd
+  Detail:     SGID binary (group gid=42) on the expected baseline list.
+
+[INFO] Standard SGID binary
+  Check:      suid.sgid_baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /sbin/unix_chkpwd
+  Detail:     SGID binary (group gid=42) on the expected baseline list.
+
+[INFO] Standard SUID binary
+  Check:      suid.baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /usr/lib/openssh/ssh-keysign
+  Detail:     SUID binary (uid=0), on the expected baseline list.
+
+[INFO] Standard SGID binary
+  Check:      suid.sgid_baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /usr/lib/x86_64-linux-gnu/utempter/utempter
+  Detail:     SGID binary (group gid=43) on the expected baseline list.
+
+[INFO] Standard SUID binary
+  Check:      suid.baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /usr/lib/dbus-1.0/dbus-daemon-launch-helper
+  Detail:     SUID binary (uid=0), on the expected baseline list.
+
+[INFO] File capability set (informational)
+  Check:      cap.present
+  Category:   capabilities
+  Confidence: CONFIRMED
+  Path:       /bin/arping
+  Detail:     Binary carries cap_net_raw in its permitted set.
+
+[INFO] File capability set (informational)
+  Check:      cap.present
+  Category:   capabilities
+  Confidence: CONFIRMED
+  Path:       /bin/mtr-packet
+  Detail:     Binary carries cap_net_raw in its permitted set.
+
+[INFO] File capability set (informational)
+  Check:      cap.present
+  Category:   capabilities
+  Confidence: CONFIRMED
+  Path:       /bin/ping
+  Detail:     Binary carries cap_net_raw in its permitted set.
+
+[INFO] Files with capabilities enumerated
+  Check:      cap.enumerated
+  Category:   capabilities
+  Confidence: CONFIRMED
+  Detail:     3 file(s) with a security.capability attribute inspected.
+
+[INFO] /etc/sudoers unreadable
+  Check:      sudo.sudoers_unreadable
+  Category:   sudo
+  Confidence: CONFIRMED
+  Path:       /etc/sudoers
+  Detail:     Direct read failed (errno=13: Permission denied). This is expected for a non-root user.
+
+[INFO] sudo -n -l fallback available but disabled
+  Check:      sudo.fallback_available
+  Category:   sudo
+  Confidence: CONFIRMED
+  Detail:     Re-run with --sudo-fallback to attempt 'sudo -n -l' as a read fallback (opt-in: shells out to sudo, see --help).
+
+[INFO] Process scan coverage limitation
+  Check:      proc.coverage_limitation
+  Category:   processes
+  Confidence: CONFIRMED
+  Detail:     /proc/<pid>/exe is only readable for the invoking user's own processes, or for all processes if this audit itself runs as root. As a non-root user this scan is blind to most other users' and root's processes.
+
+[INFO] Scan not applicable on this platform
+  Check:      platform.not_applicable
+  Category:   autostart
+  Confidence: CONFIRMED
+  Detail:     The 'autostart' scan is implemented in the Windows build only.
+
+[INFO] Scan not applicable on this platform
+  Check:      platform.not_applicable
+  Category:   privileges
+  Confidence: CONFIRMED
+  Detail:     The 'privileges' scan is implemented in the Windows build only.
+
+NOTE: Findings are audit results requiring human verification, not proof of exploitability. A nonzero exit code means findings were reported - it does not mean exploitation was attempted or confirmed.

@@ -1,0 +1,23 @@
+# Build outputs
+/privesc-auditor
+/privesc-auditor.exe
+/privesc-auditor.san
+*.o
+*.obj
+a.out
+
+# Test / scratch output
+__pycache__/
+*.pyc
+/tmp_*
+/*.out
+/*.log
+/coverage/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db

@@ -3189,14 +3189,37 @@ static void sort_findings(FindingList *fl) {
     }
 }
 
-static void print_banner(const HostInfo *h) {
-    printf("========================================\n");
+/* Header artwork: an escalation chain from an unprivileged uid up to root,
+ * then the wordmark. Purely decorative - printed before any scan runs and
+ * never parsed by report consumers (--json output is unaffected). */
+static void print_ascii_art(void) {
 #ifdef _WIN32
-    printf(" Windows Privilege Escalation Auditor\n");
-#else
-    printf(" Linux Privilege Escalation Auditor\n");
+    /* The artwork is non-ASCII; without a UTF-8 console code page a legacy
+     * OEM code page (437) renders box-drawing and block glyphs as mojibake. */
+    SetConsoleOutputCP(CP_UTF8);
 #endif
-    printf("========================================\n\n");
+    puts("                       ┌──────────┐");
+    puts("                       │ root  ♛  │");
+    puts("                 ┌─────┴──────────┘");
+    puts("                 │ sudo NOPASSWD");
+    puts("           ┌─────┘");
+    puts("           │ cron: writable script");
+    puts("     ┌─────┘");
+    puts("     │ SUID: /opt/tools/backup");
+    puts(" ┌───┴──────┐");
+    puts(" │ uid=1000 │");
+    puts(" └──────────┘");
+    puts("");
+    puts(" █▀█ █▀█ █ █ █ █▀▀ █▀ █▀▀ █▀▀ ▄▄ ▄▀█ █ █ █▀▄ █ ▀█▀");
+    puts(" █▀▀ █▀▄ █ ▀▄▀ ██▄ ▄█ ██▄ █▄▄    █▀█ █▄█ █▄▀ █  █");
+    puts(" linux + windows · read-only · human-verified");
+}
+
+/* The artwork *is* the banner now: no rule lines, no separate title line -
+ * the wordmark already says what the tool is. */
+static void print_banner(const HostInfo *h) {
+    print_ascii_art();
+    printf("\n");
     printf("User:   %s\n", h->user);
 #ifdef _WIN32
     printf("OS:     %s\n", h->distro);

@@ -69,6 +69,13 @@ grep -q '\[+\] System enumeration' "$TMP/report.txt" && ok "text report contains
                                                      || bad "text report missing scan progress"
 grep -q 'Scan coverage:' "$TMP/report.txt" && ok "text report states scan coverage" \
                                             || bad "text report missing scan coverage"
+grep -q 'root  ♛' "$TMP/report.txt" && ok "text report opens with the ASCII-art banner" \
+                                     || bad "text report missing the ASCII-art banner"
+if grep -q 'human-verified' "$TMP/report.json"; then
+    bad "ASCII-art banner leaked into the JSON report"
+else
+    ok "JSON report stays art-free"
+fi
 
 # ---------------------------------------------------------------- JSON
 step "JSON schema"

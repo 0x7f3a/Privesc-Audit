@@ -297,9 +297,6 @@ Always confirm manually before acting on a finding.
  █▀█ █▀█ █ █ █ █▀▀ █▀ █▀▀ █▀▀ ▄▄ ▄▀█ █ █ █▀▄ █ ▀█▀
  █▀▀ █▀▄ █ ▀▄▀ ██▄ ▄█ ██▄ █▄▄    █▀█ █▄█ █▄▀ █  █
  linux + windows · read-only · human-verified
-========================================
- Linux Privilege Escalation Auditor
-========================================
 
 User:   analyst
 UID:    1000

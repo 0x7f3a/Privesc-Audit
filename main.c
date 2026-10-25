@@ -3215,15 +3215,11 @@ static void print_ascii_art(void) {
     puts(" linux + windows · read-only · human-verified");
 }
 
+/* The artwork *is* the banner now: no rule lines, no separate title line -
+ * the wordmark already says what the tool is. */
 static void print_banner(const HostInfo *h) {
     print_ascii_art();
-    printf("========================================\n");
-#ifdef _WIN32
-    printf(" Windows Privilege Escalation Auditor\n");
-#else
-    printf(" Linux Privilege Escalation Auditor\n");
-#endif
-    printf("========================================\n\n");
+    printf("\n");
     printf("User:   %s\n", h->user);
 #ifdef _WIN32
     printf("OS:     %s\n", h->distro);

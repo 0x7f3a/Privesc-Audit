@@ -282,6 +282,21 @@ Always confirm manually before acting on a finding.
 ## Example output
 
 ```
+                       ┌──────────┐
+                       │ root  ♛  │
+                 ┌─────┴──────────┘
+                 │ sudo NOPASSWD
+           ┌─────┘
+           │ cron: writable script
+     ┌─────┘
+     │ SUID: /opt/tools/backup
+ ┌───┴──────┐
+ │ uid=1000 │
+ └──────────┘
+
+ █▀█ █▀█ █ █ █ █▀▀ █▀ █▀▀ █▀▀ ▄▄ ▄▀█ █ █ █▀▄ █ ▀█▀
+ █▀▀ █▀▄ █ ▀▄▀ ██▄ ▄█ ██▄ █▄▄    █▀█ █▄█ █▄▀ █  █
+ linux + windows · read-only · human-verified
 ========================================
  Linux Privilege Escalation Auditor
 ========================================

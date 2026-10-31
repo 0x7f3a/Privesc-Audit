@@ -76,6 +76,39 @@ if grep -q 'human-verified' "$TMP/report.json"; then
 else
     ok "JSON report stays art-free"
 fi
+grep -q 'Next steps:' "$TMP/report.txt" && ok "text report suggests next steps" \
+                                     || bad "text report has no next-step suggestions"
+if grep -q '"actions": \[' "$TMP/report.json"; then
+    ok "JSON findings carry an actions array"
+else
+    bad "JSON findings carry no actions"
+fi
+"$BIN" --verbose --json --no-actions >"$TMP/noact.json" 2>/dev/null
+if grep -q '"actions"' "$TMP/noact.json"; then
+    bad "--no-actions still emitted actions"
+else
+    ok "--no-actions omits the actions array"
+fi
+
+# Calibration: a writable directory inside the account's own profile must not
+# be reported HIGH, and must be summarised under a single LOW finding.
+python3 - "$TMP/report.json" <<'PY' && ok "PATH severity is calibrated to ownership" \
+                                    || bad "PATH severity calibration regressed"
+import json, os, sys
+f = json.load(open(sys.argv[1]))["findings"]
+home = os.environ.get("HOME", "").rstrip("/")
+errs = []
+for x in f:
+    if x.get("check_id") == "fs.path_writable" and home:
+        p = x.get("path", "")
+        if p == home or p.startswith(home + "/"):
+            errs.append("in-profile directory reported HIGH: %s" % p)
+    if x.get("check_id") == "fs.path_writable_user_profile" and x.get("severity") != "LOW":
+        errs.append("profile summary is %s, expected LOW" % x.get("severity"))
+if errs:
+    print("        " + "\n        ".join(errs))
+    sys.exit(1)
+PY
 
 # ---------------------------------------------------------------- JSON
 step "JSON schema"

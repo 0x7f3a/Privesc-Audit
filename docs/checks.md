@@ -11,7 +11,7 @@ checks are compiled only into that build, `both` into either. Severity and
 confidence are what the code passes at the call site; a few checks vary at
 runtime (see the notes under the tables).
 
-**110 check ids.**
+**111 check ids.**
 
 ### `system` (3)
 
@@ -123,12 +123,12 @@ runtime (see the notes under the tables).
 | `proc.writable_exe` | HIGH | LIKELY | linux | Root process with writable binary |
 | `proc.writable_exe_root_auditor` | INFO | CONFIRMED | linux | Root process writable by root (auditor) |
 
-### `filesystem` (16)
+### `filesystem` (17)
 
 | Check ID | Severity | Confidence | Platform | Title |
 | -------- | -------- | ---------- | -------- | ----- |
 | `fs.path_empty_component` | MEDIUM | LIKELY | linux | Empty $PATH component |
-| `fs.path_empty_component` | MEDIUM | LIKELY | windows | Empty PATH component |
+| `fs.path_empty_component` | LOW | LIKELY | windows | Empty PATH component |
 | `fs.path_not_dir` | LOW | CONFIRMED | linux | Non-directory $PATH entry |
 | `fs.path_overlong` | LOW | CONFIRMED | linux | Overlong $PATH value |
 | `fs.path_overlong` | LOW | CONFIRMED | windows | Overlong PATH value |
@@ -138,6 +138,7 @@ runtime (see the notes under the tables).
 | `fs.path_writable` | HIGH | CONFIRMED | windows | Writable directory in PATH |
 | `fs.path_writable_root_auditor` | INFO | CONFIRMED | linux | Writable $PATH directory (root auditor) |
 | `fs.path_writable_root_auditor` | INFO | CONFIRMED | windows | Writable PATH directory (elevated auditor) |
+| `fs.path_writable_user_profile` | LOW | CONFIRMED | both | Writable directory in your own PATH / Writable directories in your own PATH |
 | `fs.sensitive_writable` | CRITICAL / HIGH | CONFIRMED | linux | Writable sensitive file |
 | `fs.sensitive_writable_root_auditor` | INFO | CONFIRMED | linux | Writable sensitive file (root auditor) |
 | `fs.shadow_readable` | HIGH | CONFIRMED | linux | Readable shadow file |
@@ -164,7 +165,7 @@ runtime (see the notes under the tables).
 | `auto.run_target_writable` | HIGH | LIKELY | windows | Writable autostart target |
 | `auto.run_target_writable_root_auditor` | INFO | CONFIRMED | windows | Writable autostart target (elevated auditor) |
 | `auto.startup_dir_root_auditor` | INFO | CONFIRMED | windows | Writable Startup folder (elevated auditor) |
-| `auto.startup_dir_user_writable` | LOW | CONFIRMED | windows | Writable per-user Startup folder |
+| `auto.startup_dir_user_writable` | INFO | CONFIRMED | windows | Writable per-user Startup folder (own account) |
 | `auto.startup_dir_writable` | HIGH | CONFIRMED | windows | Writable all-users Startup folder |
 | `auto.startup_file_root_auditor` | INFO | CONFIRMED | windows | Writable Startup entry (elevated auditor) |
 | `auto.startup_file_writable` | HIGH | CONFIRMED | windows | Writable all-users Startup entry |

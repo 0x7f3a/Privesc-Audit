@@ -1,6 +1,6 @@
 {
   "tool": "privesc-auditor",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "host": {
     "platform": "linux",
     "elevated": false,
@@ -17,22 +17,25 @@
     "roots_missing_expected": 5
   },
   "summary": {
-    "total": 28,
+    "total": 29,
     "critical": 0,
-    "high": 1,
+    "high": 0,
     "medium": 0,
-    "low": 0,
-    "info": 27
+    "low": 1,
+    "info": 28
   },
   "findings": [
     {
-      "check_id": "fs.path_writable",
-      "severity": "HIGH",
+      "check_id": "fs.path_writable_user_profile",
+      "severity": "LOW",
       "confidence": "CONFIRMED",
       "category": "filesystem",
-      "title": "Writable directory in $PATH",
+      "title": "Writable directory in your own PATH",
       "path": "/workspace/homes/e95235b8007cb879b16fd75e/.local/bin",
-      "detail": "A writable PATH dir allows planting trojan binaries."
+      "detail": "1 writable directory inside this account's own profile (/workspace/homes/e95235b8007cb879b16fd75e/.local/bin). Writing there grants no new privilege; it only matters if a privileged process resolves a bare command name through this $PATH.",
+      "actions": [
+        "ls -ld \"/workspace/homes/e95235b8007cb879b16fd75e/.local/bin\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "sys.profile",
@@ -50,7 +53,10 @@
       "category": "suid",
       "title": "Standard SGID binary",
       "path": "/bin/chage",
-      "detail": "SGID binary (group gid=42) on the expected baseline list."
+      "detail": "SGID binary (group gid=42) on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/bin/chage\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "suid.baseline",
@@ -59,7 +65,10 @@
       "category": "suid",
       "title": "Standard SUID binary",
       "path": "/bin/chfn",
-      "detail": "SUID binary (uid=0), on the expected baseline list."
+      "detail": "SUID binary (uid=0), on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/bin/chfn\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "suid.baseline",
@@ -68,7 +77,10 @@
       "category": "suid",
       "title": "Standard SUID binary",
       "path": "/bin/chsh",
-      "detail": "SUID binary (uid=0), on the expected baseline list."
+      "detail": "SUID binary (uid=0), on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/bin/chsh\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "suid.sgid_baseline",
@@ -77,7 +89,22 @@
       "category": "suid",
       "title": "Standard SGID binary",
       "path": "/bin/expiry",
-      "detail": "SGID binary (group gid=42) on the expected baseline list."
+      "detail": "SGID binary (group gid=42) on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/bin/expiry\"   # confirm the owner and mode this finding rests on"
+      ]
+    },
+    {
+      "check_id": "suid.baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SUID binary",
+      "path": "/bin/fusermount3",
+      "detail": "SUID binary (uid=0), on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/bin/fusermount3\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "suid.baseline",
@@ -86,7 +113,10 @@
       "category": "suid",
       "title": "Standard SUID binary",
       "path": "/bin/gpasswd",
-      "detail": "SUID binary (uid=0), on the expected baseline list."
+      "detail": "SUID binary (uid=0), on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/bin/gpasswd\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "suid.baseline",
@@ -95,7 +125,10 @@
       "category": "suid",
       "title": "Standard SUID binary",
       "path": "/bin/mount",
-      "detail": "SUID binary (uid=0), on the expected baseline list."
+      "detail": "SUID binary (uid=0), on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/bin/mount\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "suid.baseline",
@@ -104,7 +137,10 @@
       "category": "suid",
       "title": "Standard SUID binary",
       "path": "/bin/newgrp",
-      "detail": "SUID binary (uid=0), on the expected baseline list."
+      "detail": "SUID binary (uid=0), on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/bin/newgrp\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "suid.baseline",
@@ -113,7 +149,10 @@
       "category": "suid",
       "title": "Standard SUID binary",
       "path": "/bin/passwd",
-      "detail": "SUID binary (uid=0), on the expected baseline list."
+      "detail": "SUID binary (uid=0), on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/bin/passwd\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "suid.sgid_baseline",
@@ -122,7 +161,10 @@
       "category": "suid",
       "title": "Standard SGID binary",
       "path": "/bin/ssh-agent",
-      "detail": "SGID binary (group gid=101) on the expected baseline list."
+      "detail": "SGID binary (group gid=101) on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/bin/ssh-agent\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "suid.baseline",
@@ -131,7 +173,10 @@
       "category": "suid",
       "title": "Standard SUID binary",
       "path": "/bin/su",
-      "detail": "SUID binary (uid=0), on the expected baseline list."
+      "detail": "SUID binary (uid=0), on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/bin/su\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "suid.baseline",
@@ -140,7 +185,10 @@
       "category": "suid",
       "title": "Standard SUID binary",
       "path": "/bin/sudo",
-      "detail": "SUID binary (uid=0), on the expected baseline list."
+      "detail": "SUID binary (uid=0), on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/bin/sudo\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "suid.baseline",
@@ -149,7 +197,10 @@
       "category": "suid",
       "title": "Standard SUID binary",
       "path": "/bin/umount",
-      "detail": "SUID binary (uid=0), on the expected baseline list."
+      "detail": "SUID binary (uid=0), on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/bin/umount\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "suid.sgid_baseline",
@@ -158,7 +209,10 @@
       "category": "suid",
       "title": "Standard SGID binary",
       "path": "/sbin/pam_extrausers_chkpwd",
-      "detail": "SGID binary (group gid=42) on the expected baseline list."
+      "detail": "SGID binary (group gid=42) on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/sbin/pam_extrausers_chkpwd\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "suid.sgid_baseline",
@@ -167,25 +221,10 @@
       "category": "suid",
       "title": "Standard SGID binary",
       "path": "/sbin/unix_chkpwd",
-      "detail": "SGID binary (group gid=42) on the expected baseline list."
-    },
-    {
-      "check_id": "suid.baseline",
-      "severity": "INFO",
-      "confidence": "CONFIRMED",
-      "category": "suid",
-      "title": "Standard SUID binary",
-      "path": "/usr/lib/openssh/ssh-keysign",
-      "detail": "SUID binary (uid=0), on the expected baseline list."
-    },
-    {
-      "check_id": "suid.sgid_baseline",
-      "severity": "INFO",
-      "confidence": "CONFIRMED",
-      "category": "suid",
-      "title": "Standard SGID binary",
-      "path": "/usr/lib/x86_64-linux-gnu/utempter/utempter",
-      "detail": "SGID binary (group gid=43) on the expected baseline list."
+      "detail": "SGID binary (group gid=42) on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/sbin/unix_chkpwd\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "suid.baseline",
@@ -194,7 +233,34 @@
       "category": "suid",
       "title": "Standard SUID binary",
       "path": "/usr/lib/dbus-1.0/dbus-daemon-launch-helper",
-      "detail": "SUID binary (uid=0), on the expected baseline list."
+      "detail": "SUID binary (uid=0), on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/usr/lib/dbus-1.0/dbus-daemon-launch-helper\"   # confirm the owner and mode this finding rests on"
+      ]
+    },
+    {
+      "check_id": "suid.baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SUID binary",
+      "path": "/usr/lib/openssh/ssh-keysign",
+      "detail": "SUID binary (uid=0), on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/usr/lib/openssh/ssh-keysign\"   # confirm the owner and mode this finding rests on"
+      ]
+    },
+    {
+      "check_id": "suid.sgid_baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SGID binary",
+      "path": "/usr/lib/x86_64-linux-gnu/utempter/utempter",
+      "detail": "SGID binary (group gid=43) on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/usr/lib/x86_64-linux-gnu/utempter/utempter\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "cap.present",
@@ -203,7 +269,10 @@
       "category": "capabilities",
       "title": "File capability set (informational)",
       "path": "/bin/arping",
-      "detail": "Binary carries cap_net_raw in its permitted set."
+      "detail": "Binary carries cap_net_raw in its permitted set.",
+      "actions": [
+        "ls -ld \"/bin/arping\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "cap.present",
@@ -212,7 +281,10 @@
       "category": "capabilities",
       "title": "File capability set (informational)",
       "path": "/bin/mtr-packet",
-      "detail": "Binary carries cap_net_raw in its permitted set."
+      "detail": "Binary carries cap_net_raw in its permitted set.",
+      "actions": [
+        "ls -ld \"/bin/mtr-packet\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "cap.present",
@@ -221,7 +293,10 @@
       "category": "capabilities",
       "title": "File capability set (informational)",
       "path": "/bin/ping",
-      "detail": "Binary carries cap_net_raw in its permitted set."
+      "detail": "Binary carries cap_net_raw in its permitted set.",
+      "actions": [
+        "ls -ld \"/bin/ping\"   # confirm the owner and mode this finding rests on"
+      ]
     },
     {
       "check_id": "cap.enumerated",
@@ -239,7 +314,11 @@
       "category": "sudo",
       "title": "/etc/sudoers unreadable",
       "path": "/etc/sudoers",
-      "detail": "Direct read failed (errno=13: Permission denied). This is expected for a non-root user."
+      "detail": "Direct read failed (errno=13: Permission denied). This is expected for a non-root user.",
+      "actions": [
+        "ls -ld \"/etc/sudoers\"   # confirm the owner and mode this finding rests on",
+        "sudo -n -l   # list what this account may run unauthenticated"
+      ]
     },
     {
       "check_id": "sudo.fallback_available",
@@ -248,7 +327,10 @@
       "category": "sudo",
       "title": "sudo -n -l fallback available but disabled",
       "path": "",
-      "detail": "Re-run with --sudo-fallback to attempt 'sudo -n -l' as a read fallback (opt-in: shells out to sudo, see --help)."
+      "detail": "Re-run with --sudo-fallback to attempt 'sudo -n -l' as a read fallback (opt-in: shells out to sudo, see --help).",
+      "actions": [
+        "sudo -n -l   # list what this account may run unauthenticated"
+      ]
     },
     {
       "check_id": "proc.coverage_limitation",

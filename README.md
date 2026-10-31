@@ -37,6 +37,10 @@ ranked by severity, so a human can focus on verification and remediation.
   sensitive files (`/etc/passwd`, `/etc/shadow`, …).
 - Applies a **coarse** kernel-version heuristic against a small built-in table
   of well-known local-privesc CVEs.
+- Suggests **next steps** for findings that have a known technique:
+  GTFOBins-pattern commands (sudo, SUID, capabilities) and, on Windows, the
+  `icacls` / `sc qc` / `reg query` commands that confirm the finding. They are
+  printed for you to run; the tool never executes them.
 - Emits either a human-readable report or machine-readable JSON.
 - Returns an exit code reflecting the worst severity found (useful in CI).
 
@@ -149,6 +153,7 @@ with `_WIN32`; selecting a category that only exists on the other platform with
 | `--verbose`, `-v`   | Include INFO-level findings in text output.             |
 | `--json`            | Emit JSON instead of the text report.                   |
 | `--no-color`        | Disable ANSI colors (also auto-off when not a TTY).     |
+| `--no-actions`      | Omit the per-finding next-step suggestions.             |
 | `--check <cat>`     | Run only the named category. Repeat to select several.  |
 | `--sudo-fallback`   | POSIX only: parse `sudo -n -l` if sudoers is unreadable. |
 
@@ -198,10 +203,10 @@ It needs `cc` and `python3` and writes nothing outside a temporary directory.
 | Level      | Meaning                                                              |
 | ---------- | ------------------------------------------------------------------- |
 | `CRITICAL` | Direct, high-confidence escalation primitive (e.g. writable SUID root binary, writable sudoers policy file, writable service image running as SYSTEM, writable machine-wide `Run` key, writable `/etc/passwd`). |
-| `HIGH`     | Strong escalation path likely (writable cron/service target, dangerous capability, writable `$PATH`). |
+| `HIGH`     | Strong escalation path likely (writable cron/service target, dangerous capability, writable `$PATH` **outside your own profile**). |
 | `MEDIUM`   | Notable misconfiguration worth investigating (non-baseline SUID, passwordless sudo rule, missing sticky bit). |
-| `LOW`      | Minor hygiene issue.                                                 |
-| `INFO`     | Context / baseline facts; hidden unless `--verbose`.                 |
+| `LOW`      | Minor hygiene issue (writable `$PATH` directories inside your own profile, empty `PATH` entry on Windows). |
+| `INFO`     | Context / baseline facts (your own per-user Startup folder, stock binaries); hidden unless `--verbose`. |
 
 ## Confidence levels
 
@@ -240,8 +245,14 @@ Expect them, especially at `POSSIBLE` confidence. Common causes:
   built-in baseline; many legitimate vendor binaries will appear here.
 - `NOPASSWD` sudo rules are sometimes intentional and appropriately scoped.
 - A writable `$PATH` directory under your own home is normal for user-local
-  tooling but is still reported, because it matters when another user's
-  privileged process inherits that `PATH`.
+  tooling. Since 2.1 these are reported as a **single `LOW` finding**
+  (`fs.path_writable_user_profile`) instead of one `HIGH` per directory, since
+  they cross no privilege boundary by themselves. A writable `PATH` directory
+  *outside* your profile is still `HIGH`.
+- Writability is judged by the right an attack needs — creating a file in a
+  directory, or overwriting a file's data — not by `GENERIC_WRITE`. An ACL that
+  only allows changing attributes no longer counts as "writable", and a
+  directory where you may create files counts even without `READ_CONTROL`.
 - Kernel CVE matches ignore backports (see above).
 
 Always confirm manually before acting on a finding.
@@ -323,11 +334,14 @@ Info:     2
 Potential privilege-escalation paths:
 
 [CRITICAL] Writable root-owned SUID binary
+  Check:      suid.writable_root
   Category:   suid
   Confidence: CONFIRMED
   Path:       /opt/tools/backup
   Detail:     SUID binary is writable by the current user - direct code
               execution as owner is likely.
+  Next steps:
+    $ ls -ld "/opt/tools/backup"   # confirm the owner and mode this finding rests on
 
 [HIGH] Writable file in cron job
   Category:   cron
@@ -349,7 +363,31 @@ lists every check id the tool can emit.
 
 JSON output (`--json`) mirrors the same data as a single object with `host`,
 `summary`, and a `findings` array — suitable for piping into `jq` or a pipeline.
+A finding may also carry an `actions` array with its suggested next steps.
 `host.uid` is `null` on Windows, where a uid would be meaningless.
+
+## Recommended next steps
+
+Each finding can carry up to four commands: the one that confirms the claim
+(`icacls` on Windows, `ls -ld` on POSIX), plus a technique when the affected
+binary or policy is known.
+
+| Finding | Suggested next step |
+| ------- | ------------------- |
+| `suid.*` on a known binary | the GTFOBins SUID invocation, e.g. `find . -exec /bin/sh -p \; -quit` |
+| `sudo.*` rule | `sudo -n -l` to list the grant, plus the GTFOBins `sudo` payload for the binary named in the rule |
+| `cap.cap_*` | `getcap` to re-confirm, plus what that capability actually buys the binary |
+| `svc.*` (Windows) | `sc qc "<name>"` to confirm the account and image |
+| `auto.run*` (Windows) | `reg query` for the autostart key |
+
+These are printed only, never executed: the auditor stays read-only. Suppress
+them with `--no-actions`; in `--json` they appear as an `actions` array.
+
+The table is deliberately small (about 40 binaries) and only covers what it
+knows: every other finding gets the "confirm this" command rather than a
+guessed exploit. Patterns follow [GTFOBins](https://gtfobins.github.io) — read
+the corresponding page before running anything, because behaviour depends on
+the binary's version and on the exact sudo rule.
 
 ## Limitations
 
@@ -375,8 +413,12 @@ JSON output (`--json`) mirrors the same data as a single object with `host`,
   each one is currently enabled — an administrator token typically holds
   `SeDebugPrivilege` disabled.
 - Machine-wide `Run` keys and the all-users Startup folder are judged by their
-  DACL; the per-user Startup folder is reported as LOW because being writable
-  by its owner is normal.
+  DACL. The per-user Startup folder is `INFO`: writable by its owner is
+  normal, and it grants persistence inside an account you already control, not
+  escalation.
+- Writable directories inside `%USERPROFILE%` — which is most developer `PATH`
+  entries (Python, VS Code, npm, WinGet, WindowsApps) — are summarised in one
+  `LOW` finding instead of one `HIGH` per directory.
 - `Run` values and service image paths are resolved to the executable they
   actually name, including unquoted paths containing spaces; the hijack
   candidates (`C:\Program.exe`, ...) are only used to judge the ambiguity.

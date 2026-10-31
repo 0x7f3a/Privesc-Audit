@@ -34,21 +34,23 @@ Scan coverage: PARTIAL
   Scan roots unreadable (real failure): 2
   Scan roots absent on this distro (expected): 5
 
-Findings: 28
+Findings: 29
 Critical: 0
-High:     1
+High:     0
 Medium:   0
-Low:      0
-Info:     27
+Low:      1
+Info:     28
 
 Potential privilege-escalation paths:
 
-[HIGH] Writable directory in $PATH
-  Check:      fs.path_writable
+[LOW] Writable directory in your own PATH
+  Check:      fs.path_writable_user_profile
   Category:   filesystem
   Confidence: CONFIRMED
   Path:       /workspace/homes/e95235b8007cb879b16fd75e/.local/bin
-  Detail:     A writable PATH dir allows planting trojan binaries.
+  Detail:     1 writable directory inside this account's own profile (/workspace/homes/e95235b8007cb879b16fd75e/.local/bin). Writing there grants no new privilege; it only matters if a privileged process resolves a bare command name through this $PATH.
+  Next steps:
+    $ ls -ld "/workspace/homes/e95235b8007cb879b16fd75e/.local/bin"   # confirm the owner and mode this finding rests on
 
 [INFO] System profile
   Check:      sys.profile
@@ -62,6 +64,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/chage
   Detail:     SGID binary (group gid=42) on the expected baseline list.
+  Next steps:
+    $ ls -ld "/bin/chage"   # confirm the owner and mode this finding rests on
 
 [INFO] Standard SUID binary
   Check:      suid.baseline
@@ -69,6 +73,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/chfn
   Detail:     SUID binary (uid=0), on the expected baseline list.
+  Next steps:
+    $ ls -ld "/bin/chfn"   # confirm the owner and mode this finding rests on
 
 [INFO] Standard SUID binary
   Check:      suid.baseline
@@ -76,6 +82,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/chsh
   Detail:     SUID binary (uid=0), on the expected baseline list.
+  Next steps:
+    $ ls -ld "/bin/chsh"   # confirm the owner and mode this finding rests on
 
 [INFO] Standard SGID binary
   Check:      suid.sgid_baseline
@@ -83,6 +91,17 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/expiry
   Detail:     SGID binary (group gid=42) on the expected baseline list.
+  Next steps:
+    $ ls -ld "/bin/expiry"   # confirm the owner and mode this finding rests on
+
+[INFO] Standard SUID binary
+  Check:      suid.baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /bin/fusermount3
+  Detail:     SUID binary (uid=0), on the expected baseline list.
+  Next steps:
+    $ ls -ld "/bin/fusermount3"   # confirm the owner and mode this finding rests on
 
 [INFO] Standard SUID binary
   Check:      suid.baseline
@@ -90,6 +109,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/gpasswd
   Detail:     SUID binary (uid=0), on the expected baseline list.
+  Next steps:
+    $ ls -ld "/bin/gpasswd"   # confirm the owner and mode this finding rests on
 
 [INFO] Standard SUID binary
   Check:      suid.baseline
@@ -97,6 +118,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/mount
   Detail:     SUID binary (uid=0), on the expected baseline list.
+  Next steps:
+    $ ls -ld "/bin/mount"   # confirm the owner and mode this finding rests on
 
 [INFO] Standard SUID binary
   Check:      suid.baseline
@@ -104,6 +127,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/newgrp
   Detail:     SUID binary (uid=0), on the expected baseline list.
+  Next steps:
+    $ ls -ld "/bin/newgrp"   # confirm the owner and mode this finding rests on
 
 [INFO] Standard SUID binary
   Check:      suid.baseline
@@ -111,6 +136,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/passwd
   Detail:     SUID binary (uid=0), on the expected baseline list.
+  Next steps:
+    $ ls -ld "/bin/passwd"   # confirm the owner and mode this finding rests on
 
 [INFO] Standard SGID binary
   Check:      suid.sgid_baseline
@@ -118,6 +145,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/ssh-agent
   Detail:     SGID binary (group gid=101) on the expected baseline list.
+  Next steps:
+    $ ls -ld "/bin/ssh-agent"   # confirm the owner and mode this finding rests on
 
 [INFO] Standard SUID binary
   Check:      suid.baseline
@@ -125,6 +154,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/su
   Detail:     SUID binary (uid=0), on the expected baseline list.
+  Next steps:
+    $ ls -ld "/bin/su"   # confirm the owner and mode this finding rests on
 
 [INFO] Standard SUID binary
   Check:      suid.baseline
@@ -132,6 +163,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/sudo
   Detail:     SUID binary (uid=0), on the expected baseline list.
+  Next steps:
+    $ ls -ld "/bin/sudo"   # confirm the owner and mode this finding rests on
 
 [INFO] Standard SUID binary
   Check:      suid.baseline
@@ -139,6 +172,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/umount
   Detail:     SUID binary (uid=0), on the expected baseline list.
+  Next steps:
+    $ ls -ld "/bin/umount"   # confirm the owner and mode this finding rests on
 
 [INFO] Standard SGID binary
   Check:      suid.sgid_baseline
@@ -146,6 +181,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /sbin/pam_extrausers_chkpwd
   Detail:     SGID binary (group gid=42) on the expected baseline list.
+  Next steps:
+    $ ls -ld "/sbin/pam_extrausers_chkpwd"   # confirm the owner and mode this finding rests on
 
 [INFO] Standard SGID binary
   Check:      suid.sgid_baseline
@@ -153,20 +190,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /sbin/unix_chkpwd
   Detail:     SGID binary (group gid=42) on the expected baseline list.
-
-[INFO] Standard SUID binary
-  Check:      suid.baseline
-  Category:   suid
-  Confidence: CONFIRMED
-  Path:       /usr/lib/openssh/ssh-keysign
-  Detail:     SUID binary (uid=0), on the expected baseline list.
-
-[INFO] Standard SGID binary
-  Check:      suid.sgid_baseline
-  Category:   suid
-  Confidence: CONFIRMED
-  Path:       /usr/lib/x86_64-linux-gnu/utempter/utempter
-  Detail:     SGID binary (group gid=43) on the expected baseline list.
+  Next steps:
+    $ ls -ld "/sbin/unix_chkpwd"   # confirm the owner and mode this finding rests on
 
 [INFO] Standard SUID binary
   Check:      suid.baseline
@@ -174,6 +199,26 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /usr/lib/dbus-1.0/dbus-daemon-launch-helper
   Detail:     SUID binary (uid=0), on the expected baseline list.
+  Next steps:
+    $ ls -ld "/usr/lib/dbus-1.0/dbus-daemon-launch-helper"   # confirm the owner and mode this finding rests on
+
+[INFO] Standard SUID binary
+  Check:      suid.baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /usr/lib/openssh/ssh-keysign
+  Detail:     SUID binary (uid=0), on the expected baseline list.
+  Next steps:
+    $ ls -ld "/usr/lib/openssh/ssh-keysign"   # confirm the owner and mode this finding rests on
+
+[INFO] Standard SGID binary
+  Check:      suid.sgid_baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /usr/lib/x86_64-linux-gnu/utempter/utempter
+  Detail:     SGID binary (group gid=43) on the expected baseline list.
+  Next steps:
+    $ ls -ld "/usr/lib/x86_64-linux-gnu/utempter/utempter"   # confirm the owner and mode this finding rests on
 
 [INFO] File capability set (informational)
   Check:      cap.present
@@ -181,6 +226,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/arping
   Detail:     Binary carries cap_net_raw in its permitted set.
+  Next steps:
+    $ ls -ld "/bin/arping"   # confirm the owner and mode this finding rests on
 
 [INFO] File capability set (informational)
   Check:      cap.present
@@ -188,6 +235,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/mtr-packet
   Detail:     Binary carries cap_net_raw in its permitted set.
+  Next steps:
+    $ ls -ld "/bin/mtr-packet"   # confirm the owner and mode this finding rests on
 
 [INFO] File capability set (informational)
   Check:      cap.present
@@ -195,6 +244,8 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /bin/ping
   Detail:     Binary carries cap_net_raw in its permitted set.
+  Next steps:
+    $ ls -ld "/bin/ping"   # confirm the owner and mode this finding rests on
 
 [INFO] Files with capabilities enumerated
   Check:      cap.enumerated
@@ -208,12 +259,17 @@ Potential privilege-escalation paths:
   Confidence: CONFIRMED
   Path:       /etc/sudoers
   Detail:     Direct read failed (errno=13: Permission denied). This is expected for a non-root user.
+  Next steps:
+    $ ls -ld "/etc/sudoers"   # confirm the owner and mode this finding rests on
+    $ sudo -n -l   # list what this account may run unauthenticated
 
 [INFO] sudo -n -l fallback available but disabled
   Check:      sudo.fallback_available
   Category:   sudo
   Confidence: CONFIRMED
   Detail:     Re-run with --sudo-fallback to attempt 'sudo -n -l' as a read fallback (opt-in: shells out to sudo, see --help).
+  Next steps:
+    $ sudo -n -l   # list what this account may run unauthenticated
 
 [INFO] Process scan coverage limitation
   Check:      proc.coverage_limitation
@@ -232,5 +288,7 @@ Potential privilege-escalation paths:
   Category:   privileges
   Confidence: CONFIRMED
   Detail:     The 'privileges' scan is implemented in the Windows build only.
+
+Next steps are standard public techniques (GTFOBins patterns) to run yourself on a host you are authorised to test; this tool never executes them.
 
 NOTE: Findings are audit results requiring human verification, not proof of exploitability. A nonzero exit code means findings were reported - it does not mean exploitation was attempted or confirmed.

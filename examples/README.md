@@ -7,8 +7,8 @@ Real, unmodified output from this tool — not hand-written samples.
 | `linux-report.txt`    | `./privesc-auditor --verbose --no-color` | Ubuntu 24.04 container, non-root user    |
 | `linux-report.json`   | `./privesc-auditor --verbose --json`     | same run, machine-readable form          |
 
-Both files describe the **same run**: 29 findings (1 `LOW`, 28 `INFO`), scan
-coverage `PARTIAL`. The container is a nearly stock system, so the interesting
+Both files describe the **same run**: 27 findings (1 `LOW`, 26 `INFO`), scan
+coverage `PARTIAL`. 24 of them carry `actions` next-step commands. The container is a nearly stock system, so the interesting
 part of the report is the structure rather than the number of defects:
 
 - `fs.path_writable_user_profile` — a writable directory on `$PATH`, summarised

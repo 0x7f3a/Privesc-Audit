@@ -34,12 +34,12 @@ Scan coverage: PARTIAL
   Scan roots unreadable (real failure): 2
   Scan roots absent on this distro (expected): 5
 
-Findings: 29
+Findings: 27
 Critical: 0
 High:     0
 Medium:   0
 Low:      1
-Info:     28
+Info:     26
 
 Potential privilege-escalation paths:
 
@@ -202,15 +202,6 @@ Potential privilege-escalation paths:
   Next steps:
     $ ls -ld "/usr/lib/dbus-1.0/dbus-daemon-launch-helper"   # confirm the owner and mode this finding rests on
 
-[INFO] Standard SUID binary
-  Check:      suid.baseline
-  Category:   suid
-  Confidence: CONFIRMED
-  Path:       /usr/lib/openssh/ssh-keysign
-  Detail:     SUID binary (uid=0), on the expected baseline list.
-  Next steps:
-    $ ls -ld "/usr/lib/openssh/ssh-keysign"   # confirm the owner and mode this finding rests on
-
 [INFO] Standard SGID binary
   Check:      suid.sgid_baseline
   Category:   suid
@@ -219,6 +210,15 @@ Potential privilege-escalation paths:
   Detail:     SGID binary (group gid=43) on the expected baseline list.
   Next steps:
     $ ls -ld "/usr/lib/x86_64-linux-gnu/utempter/utempter"   # confirm the owner and mode this finding rests on
+
+[INFO] Standard SUID binary
+  Check:      suid.baseline
+  Category:   suid
+  Confidence: CONFIRMED
+  Path:       /usr/lib/openssh/ssh-keysign
+  Detail:     SUID binary (uid=0), on the expected baseline list.
+  Next steps:
+    $ ls -ld "/usr/lib/openssh/ssh-keysign"   # confirm the owner and mode this finding rests on
 
 [INFO] File capability set (informational)
   Check:      cap.present
@@ -276,18 +276,6 @@ Potential privilege-escalation paths:
   Category:   processes
   Confidence: CONFIRMED
   Detail:     /proc/<pid>/exe is only readable for the invoking user's own processes, or for all processes if this audit itself runs as root. As a non-root user this scan is blind to most other users' and root's processes.
-
-[INFO] Scan not applicable on this platform
-  Check:      platform.not_applicable
-  Category:   autostart
-  Confidence: CONFIRMED
-  Detail:     The 'autostart' scan is implemented in the Windows build only.
-
-[INFO] Scan not applicable on this platform
-  Check:      platform.not_applicable
-  Category:   privileges
-  Confidence: CONFIRMED
-  Detail:     The 'privileges' scan is implemented in the Windows build only.
 
 Next steps are standard public techniques (GTFOBins patterns) to run yourself on a host you are authorised to test; this tool never executes them.
 

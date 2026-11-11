@@ -1,6 +1,6 @@
 {
   "tool": "privesc-auditor",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "host": {
     "platform": "linux",
     "elevated": false,
@@ -17,12 +17,12 @@
     "roots_missing_expected": 5
   },
   "summary": {
-    "total": 29,
+    "total": 27,
     "critical": 0,
     "high": 0,
     "medium": 0,
     "low": 1,
-    "info": 28
+    "info": 26
   },
   "findings": [
     {
@@ -239,18 +239,6 @@
       ]
     },
     {
-      "check_id": "suid.baseline",
-      "severity": "INFO",
-      "confidence": "CONFIRMED",
-      "category": "suid",
-      "title": "Standard SUID binary",
-      "path": "/usr/lib/openssh/ssh-keysign",
-      "detail": "SUID binary (uid=0), on the expected baseline list.",
-      "actions": [
-        "ls -ld \"/usr/lib/openssh/ssh-keysign\"   # confirm the owner and mode this finding rests on"
-      ]
-    },
-    {
       "check_id": "suid.sgid_baseline",
       "severity": "INFO",
       "confidence": "CONFIRMED",
@@ -260,6 +248,18 @@
       "detail": "SGID binary (group gid=43) on the expected baseline list.",
       "actions": [
         "ls -ld \"/usr/lib/x86_64-linux-gnu/utempter/utempter\"   # confirm the owner and mode this finding rests on"
+      ]
+    },
+    {
+      "check_id": "suid.baseline",
+      "severity": "INFO",
+      "confidence": "CONFIRMED",
+      "category": "suid",
+      "title": "Standard SUID binary",
+      "path": "/usr/lib/openssh/ssh-keysign",
+      "detail": "SUID binary (uid=0), on the expected baseline list.",
+      "actions": [
+        "ls -ld \"/usr/lib/openssh/ssh-keysign\"   # confirm the owner and mode this finding rests on"
       ]
     },
     {
@@ -340,24 +340,6 @@
       "title": "Process scan coverage limitation",
       "path": "",
       "detail": "/proc/<pid>/exe is only readable for the invoking user's own processes, or for all processes if this audit itself runs as root. As a non-root user this scan is blind to most other users' and root's processes."
-    },
-    {
-      "check_id": "platform.not_applicable",
-      "severity": "INFO",
-      "confidence": "CONFIRMED",
-      "category": "autostart",
-      "title": "Scan not applicable on this platform",
-      "path": "",
-      "detail": "The 'autostart' scan is implemented in the Windows build only."
-    },
-    {
-      "check_id": "platform.not_applicable",
-      "severity": "INFO",
-      "confidence": "CONFIRMED",
-      "category": "privileges",
-      "title": "Scan not applicable on this platform",
-      "path": "",
-      "detail": "The 'privileges' scan is implemented in the Windows build only."
     }
   ]
 }

@@ -69,7 +69,7 @@ runtime (see the notes under the tables).
 | `sudo.fallback_failed` | LOW | POSSIBLE | linux | sudo -n -l fallback failed to run |
 | `sudo.fallback_used` | INFO | CONFIRMED | linux | sudo -n -l fallback used |
 | `sudo.no_authenticate` | MEDIUM | LIKELY | linux | sudo !authenticate |
-| `sudo.nopasswd` | HIGH / MEDIUM | LIKELY | linux | Passwordless sudo rule |
+| `sudo.nopasswd` | runtime | LIKELY | linux | Passwordless sudo rule |
 | `sudo.sudoers_dir_writable` | CRITICAL | CONFIRMED | linux | Writable sudoers directory |
 | `sudo.sudoers_dir_writable_root_auditor` | INFO | CONFIRMED | linux | Writable sudoers directory (root auditor) |
 | `sudo.sudoers_unreadable` | INFO | CONFIRMED | linux | /etc/sudoers unreadable |
@@ -149,7 +149,7 @@ runtime (see the notes under the tables).
 
 | Check ID | Severity | Confidence | Platform | Title |
 | -------- | -------- | ---------- | -------- | ----- |
-| `pkg.kernel_cve_candidate` | HIGH | POSSIBLE | linux | Upstream kernel CVE candidate (unconfirmed) |
+| `pkg.kernel_cve_candidate` | MEDIUM | POSSIBLE | linux | Upstream kernel CVE candidate (unconfirmed) |
 | `pkg.kernel_version_unknown` | INFO | POSSIBLE | linux | Kernel version unknown |
 | `pkg.pwnkit_surface` | MEDIUM | POSSIBLE | linux | pkexec present (PwnKit surface) |
 | `pkg.pwnkit_surface_unknown_version` | MEDIUM | POSSIBLE | linux | pkexec present (PwnKit surface) |

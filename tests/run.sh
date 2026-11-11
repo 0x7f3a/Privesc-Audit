@@ -46,6 +46,20 @@ else
     bad "--version output unexpected: $(cat "$TMP/version.txt")"
 fi
 
+# ---------------------------------------------------------------- unit
+step "Unit tests (helper logic)"
+if cc -std=c11 -Wall -Wextra -Wpedantic -Werror -O1 -o "$TMP/unit" tests/unit.c 2>"$TMP/unit-build.log"; then
+    if "$TMP/unit" >"$TMP/unit.txt" 2>&1; then
+        ok "helper unit tests pass ($(grep -c '^  ok' "$TMP/unit.txt") assertions)"
+    else
+        bad "helper unit tests failed"
+        grep -A2 'FAIL' "$TMP/unit.txt" | head -20 | sed 's/^/        /'
+    fi
+else
+    bad "unit test build failed"
+    head -10 "$TMP/unit-build.log" | sed 's/^/        /'
+fi
+
 # ---------------------------------------------------------------- runs
 step "Runs"
 "$BIN" --verbose --no-color >"$TMP/report.txt" 2>"$TMP/report.err"
@@ -88,6 +102,26 @@ if grep -q '"actions"' "$TMP/noact.json"; then
     bad "--no-actions still emitted actions"
 else
     ok "--no-actions omits the actions array"
+fi
+
+# A default run must not describe the other platform's scans as "not
+# applicable": that note only makes sense for a category the caller asked for.
+if grep -q 'platform.not_applicable' "$TMP/report.txt"; then
+    bad "default run reported other-platform scans as not applicable"
+else
+    ok "default run says nothing about other-platform scans"
+fi
+"$BIN" --check autostart --json >"$TMP/na.json" 2>"$TMP/na.err"
+if grep -q 'Windows build only' "$TMP/na.err"; then
+    ok "--check autostart explains itself on stderr"
+else
+    bad "--check autostart produced no explanation"
+fi
+"$BIN" --check autostart --verbose --json >"$TMP/na.json" 2>/dev/null
+if python3 -c 'import json,sys; f=json.load(open(sys.argv[1]))["findings"]; sys.exit(0 if any(x["check_id"] == "platform.not_applicable" for x in f) else 1)' "$TMP/na.json"; then
+    ok "--verbose JSON records the note as INFO"
+else
+    bad "--verbose JSON lost the not-applicable note"
 fi
 
 # Calibration: a writable directory inside the account's own profile must not

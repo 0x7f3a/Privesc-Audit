@@ -244,6 +244,9 @@ Expect them, especially at `POSSIBLE` confidence. Common causes:
 - "Non-standard SUID binary" simply means the path is not on the tool's small
   built-in baseline; many legitimate vendor binaries will appear here.
 - `NOPASSWD` sudo rules are sometimes intentional and appropriately scoped.
+  A rule limited to named binaries is `MEDIUM`; only a bare `NOPASSWD: ALL`
+  command list is `HIGH`, so `%sudo ALL=(ALL:ALL) NOPASSWD: /usr/bin/apt`
+  no longer reads like a blank cheque.
 - A writable `$PATH` directory under your own home is normal for user-local
   tooling. Since 2.1 these are reported as a **single `LOW` finding**
   (`fs.path_writable_user_profile`) instead of one `HIGH` per directory, since
@@ -253,7 +256,12 @@ Expect them, especially at `POSSIBLE` confidence. Common causes:
   directory, or overwriting a file's data — not by `GENERIC_WRITE`. An ACL that
   only allows changing attributes no longer counts as "writable", and a
   directory where you may create files counts even without `READ_CONTROL`.
-- Kernel CVE matches ignore backports (see above).
+- Service image paths stored in the native forms (`\??\C:\...`,
+  `\SystemRoot\system32\...`) are normalized before they are checked, so those
+  services are not silently skipped. A path that still cannot be resolved is
+  reported (`perm.unevaluated`) rather than counted as "not writable".
+- Kernel CVE matches ignore backports (see above). They are therefore capped
+  at `MEDIUM`/`POSSIBLE`: a candidate to verify, never a `HIGH` verdict.
 
 Always confirm manually before acting on a finding.
 

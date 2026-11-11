@@ -71,7 +71,7 @@
  * ==================================================================== */
 
 #define TOOL_NAME    "privesc-auditor"
-#define TOOL_VERSION "2.1.0"  /* 2.1: calibrated severities + next-step guidance */
+#define TOOL_VERSION "2.1.1"  /* 2.1.1: review fixes, see the false-positive notes */
 
 #ifdef _WIN32
 #define TOOL_PLATFORM "windows"
@@ -854,6 +854,25 @@ static void win_arch_string(char *out, size_t outsz) {
     snprintf(out, outsz, "%s", a);
 }
 
+/* Service ImagePath and Run values come in several shapes: quoted, bare, or
+ * the native forms the SCM itself stores ("\??\C:\..." and
+ * "\SystemRoot\system32\..."). Passing those prefixes straight to Win32
+ * file APIs makes the object look absent, which silently disabled the
+ * writability checks on exactly the services that use them. */
+static void win_normalize_image(const char *in, char *out, size_t outsz) {
+    const char *p = in;
+    if (_strnicmp(p, "\\??\\", 4) == 0) p += 4;
+
+    if (_strnicmp(p, "\\SystemRoot\\", 12) == 0) {
+        char windir[512] = "";
+        if (!GetWindowsDirectoryA(windir, (UINT)sizeof(windir)) || !windir[0])
+            snprintf(windir, sizeof(windir), "C:\\Windows");
+        snprintf(out, outsz, "%s\\%s", windir, p + 12);
+        return;
+    }
+    snprintf(out, outsz, "%s", p);
+}
+
 /* Expand %SystemRoot% and friends so paths can be tested as-is. */
 static void win_expand_env(const char *in, char *out, size_t outsz) {
     wchar_t *win = win_wide(in);
@@ -1069,6 +1088,7 @@ static void gather_host_info(HostInfo *h) {
 #else
     h->uid = getuid();
     h->gid = getgid();
+    h->elevated = (h->uid == 0); /* keep host.elevated meaningful in JSON */
 
     struct passwd *pw = getpwuid(h->uid);
     snprintf(h->user, sizeof(h->user), "%s", pw ? pw->pw_name : "unknown");
@@ -1537,10 +1557,15 @@ static void cap_cb(const char *path, const struct stat *st, void *vctx) {
     CapCtx *c = (CapCtx *)vctx;
     unsigned char buf[64];
     ssize_t n = getxattr(path, "security.capability", buf, sizeof(buf));
-    if (n <= 0) return;
+    if (n < 12) return;
 
     /* VFS cap data: magic+flags (4 bytes LE), then permitted/inheritable
-     * dwords per 32-bit block. We OR the permitted words for a bitset. */
+     * dwords per 32-bit block. We OR the permitted words for a bitset.
+     * The magic's top byte is the revision (1, 2 or 3); anything else is not
+     * a file capability and must not be decoded as one. */
+    unsigned long revision = (unsigned)buf[3];
+    if (revision < 1 || revision > 3) return;
+
     unsigned long long permitted = 0;
     if (n >= 12) {
         permitted |= (unsigned long long)(buf[4] | (buf[5] << 8) |
@@ -1643,11 +1668,37 @@ static bool sudoers_filename_active(const char *name) {
     return true;
 }
 
+/* True when the command list of a sudoers rule is a bare ALL, i.e. every
+ * command is permitted. Skips the runas "(...)" groups and the tag words
+ * (NOPASSWD:, SETENV:, ...) so a rule scoped to one binary is not read as a
+ * blank cheque. */
+static bool sudo_rule_commands_all(const char *s) {
+    const char *p = strchr(s, '=');
+    if (!p) return false;
+    p++;
+    for (;;) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '(') {                     /* runas spec: (root) (ALL:ALL) */
+            const char *close = strchr(p, ')');
+            if (!close) return false;
+            p = close + 1;
+            continue;
+        }
+        size_t n = strcspn(p, " \t:");
+        if (n == 0 || p[n] != ':') break;     /* not a tag, this is the command */
+        p += n + 1;                           /* NOPASSWD: /usr/bin/apt */
+    }
+    if (strncmp(p, "ALL", 3) != 0) return false;
+    return p[3] == '\0' || p[3] == ' ' || p[3] == '\t' || p[3] == ',';
+}
+
 static void inspect_sudo_line(FindingList *fl, const char *source, const char *s) {
     if (strstr(s, "NOPASSWD")) {
-        Severity sev = SEV_MEDIUM;
-        if (strstr(s, "ALL") && (strstr(s, "(ALL") || strstr(s, "(root")))
-            sev = SEV_HIGH;
+        /* HIGH only for a rule that grants every command. A normal rule reads
+         * "%sudo ALL=(ALL:ALL) NOPASSWD: /usr/bin/apt"; the ALLs there are the
+         * host and runas fields, and rating them HIGH made every narrowly
+         * scoped passwordless rule look like NOPASSWD: ALL. */
+        Severity sev = sudo_rule_commands_all(s) ? SEV_HIGH : SEV_MEDIUM;
         add_finding(fl, "sudo.nopasswd", CAT_SUDO, sev, CONF_LIKELY,
                     "Passwordless sudo rule", source,
                     "NOPASSWD rule: %.200s", s);
@@ -1762,6 +1813,21 @@ static void scan_sudo(FindingList *fl, const Options *o, ScanStats *stats) {
         scan_sudo_file(fl, o, "/etc/sudoers", 0, stats);
     } else {
         int err = errno;
+        /* The read failed, but a policy file we can write is still writable,
+         * and injecting a rule is the escalation - check that before bailing
+         * out on the read. */
+        if (is_writable_by_me("/etc/sudoers")) {
+            if (o->is_root)
+                add_finding(fl, "sudo.sudoers_writable_root_auditor", CAT_SUDO, SEV_INFO,
+                            CONF_CONFIRMED, "Writable sudoers file (root auditor)",
+                            "/etc/sudoers", "Writable by root, the identity running "
+                            "this audit; not an unprivileged escalation signal.");
+            else
+                add_finding(fl, "sudo.sudoers_writable", CAT_SUDO, SEV_CRITICAL,
+                            CONF_CONFIRMED, "Writable sudoers file", "/etc/sudoers",
+                            "This sudo policy file is writable by the current user, so "
+                            "arbitrary rules (for example NOPASSWD: ALL) could be added.");
+        }
         add_finding(fl, "sudo.sudoers_unreadable", CAT_SUDO, SEV_INFO, CONF_CONFIRMED,
                     "/etc/sudoers unreadable", "/etc/sudoers",
                     "Direct read failed (errno=%d: %s). This is expected for a "
@@ -2214,9 +2280,12 @@ static void svc_cb(const char *path, const struct stat *st, void *vctx) {
     char line[2048];
     char run_user[256] = "";
     bool have_user = false;
-    char exec_target[2048] = "";
-    char exec_directive[32] = "";
-    bool have_exec = false;
+    /* ExecStart/ExecStartPre/ExecReload can each name a different binary;
+     * keeping only the last one inspected hid the others. */
+    enum { EXEC_MAX = 4 };
+    char exec_target[EXEC_MAX][1024];
+    char exec_directive[EXEC_MAX][32];
+    int nexec = 0;
 
     while (fgets(line, sizeof(line), fp)) {
         char *s = trim(line);
@@ -2242,33 +2311,45 @@ static void svc_cb(const char *path, const struct stat *st, void *vctx) {
             if (cmd[0] == '/') {
                 struct stat bst;
                 if (stat(cmd, &bst) == 0 && S_ISREG(bst.st_mode) && is_writable_by_me(cmd)) {
-                    snprintf(exec_target, sizeof(exec_target), "%s", cmd);
-                    snprintf(exec_directive, sizeof(exec_directive), "%s", directive);
-                    have_exec = true;
+                    bool dup = false;
+                    for (int k = 0; k < nexec; k++)
+                        if (strcmp(exec_target[k], cmd) == 0) dup = true;
+                    if (!dup && nexec < EXEC_MAX) {
+                        snprintf(exec_target[nexec], sizeof(exec_target[0]), "%s", cmd);
+                        snprintf(exec_directive[nexec], sizeof(exec_directive[0]),
+                                 "%s", directive);
+                        nexec++;
+                    }
                 }
             }
         }
     }
     fclose(fp);
 
-    if (!have_exec) return;
+    if (nexec == 0) return;
 
     bool runs_as_root = !have_user || strcmp(run_user, "root") == 0;
-    if (c->o->is_root) {
-        add_finding(c->fl, "svc.writable_exec_root_auditor", CAT_SERVICES, SEV_INFO,
-                    CONF_CONFIRMED, "Writable service executable (root auditor)",
-                    exec_target, "Writable by root; not an unprivileged escalation signal.");
-    } else if (runs_as_root) {
-        add_finding(c->fl, "svc.writable_exec_root", CAT_SERVICES, SEV_HIGH, CONF_LIKELY,
-                    "Writable service executable (runs as root)", exec_target,
-                    "%s target of %s is writable, and the unit has no non-root "
-                    "User= (or is explicitly User=root).", exec_directive, path);
-    } else {
-        add_finding(c->fl, "svc.writable_exec_nonroot", CAT_SERVICES, SEV_MEDIUM, CONF_LIKELY,
-                    "Writable service executable (non-root unit)", exec_target,
-                    "%s target of %s is writable, but the unit runs as User=%s, "
-                    "not root - escalation would be to that user, not root.",
-                    exec_directive, path, run_user);
+    for (int i = 0; i < nexec; i++) {
+        if (c->o->is_root) {
+            add_finding(c->fl, "svc.writable_exec_root_auditor", CAT_SERVICES, SEV_INFO,
+                        CONF_CONFIRMED, "Writable service executable (root auditor)",
+                        exec_target[i],
+                        "Writable by root; not an unprivileged escalation signal.");
+        } else if (runs_as_root) {
+            add_finding(c->fl, "svc.writable_exec_root", CAT_SERVICES, SEV_HIGH,
+                        CONF_LIKELY, "Writable service executable (runs as root)",
+                        exec_target[i],
+                        "%s target of %s is writable, and the unit has no non-root "
+                        "User= (or is explicitly User=root).",
+                        exec_directive[i], path);
+        } else {
+            add_finding(c->fl, "svc.writable_exec_nonroot", CAT_SERVICES, SEV_MEDIUM,
+                        CONF_LIKELY, "Writable service executable (non-root unit)",
+                        exec_target[i],
+                        "%s target of %s is writable, but the unit runs as User=%s, "
+                        "not root - escalation would be to that user, not root.",
+                        exec_directive[i], path, run_user);
+        }
     }
 }
 
@@ -2507,8 +2588,15 @@ static void scan_filesystem(FindingList *fl, const Options *o) {
                                     "Writable $PATH directory (root auditor)", entry,
                                     "Writable by root, the identity running this "
                                     "audit; not an unprivileged escalation signal.");
-                    else if (path_in_user_profile(entry) && nprofile < 32)
-                        profile_dirs[nprofile++] = entry;
+                    else if (path_in_user_profile(entry)) {
+                        /* Aggregate (deduplicated): a full list or a repeated
+                         * PATH entry must not silently become a HIGH finding
+                         * the profile rule says is not a boundary crossing. */
+                        bool dup = false;
+                        for (int k = 0; k < nprofile; k++)
+                            if (strcmp(profile_dirs[k], entry) == 0) dup = true;
+                        if (!dup && nprofile < 32) profile_dirs[nprofile++] = entry;
+                    }
                     else
                         add_finding(fl, "fs.path_writable", CAT_FILESYSTEM, SEV_HIGH,
                                     CONF_CONFIRMED, "Writable directory in $PATH", entry,
@@ -2631,7 +2719,10 @@ static void scan_package(FindingList *fl, const HostInfo *h, const Options *o) {
         const KernelCVE *c = &kernel_cves[i];
         if (c->maj_hi == 0 && c->maj_lo == 0) continue; /* package-based entry, not version-ranged */
         if (version_in_range(maj, min, pat, c)) {
-            add_finding(fl, "pkg.kernel_cve_candidate", CAT_PACKAGE, c->sev, CONF_POSSIBLE,
+            /* MEDIUM regardless of c->sev: the table only knows upstream
+             * ranges, and a distro kernel inside one is usually backported. */
+            add_finding(fl, "pkg.kernel_cve_candidate", CAT_PACKAGE, SEV_MEDIUM,
+                        CONF_POSSIBLE,
                         "Upstream kernel CVE candidate (unconfirmed)", h->kernel_release,
                         "Kernel %d.%d.%d falls within the historical upstream-"
                         "affected range for %s (%s). This is an UPSTREAM CANDIDATE "
@@ -2752,8 +2843,10 @@ static void win_inspect_service(FindingList *fl, const Options *o, SC_HANDLE scm
         return;
     }
 
+    char expanded_cmd[2048];
     char cmd[2048];
-    win_expand_env(raw, cmd, sizeof(cmd));
+    win_expand_env(raw, expanded_cmd, sizeof(expanded_cmd));
+    win_normalize_image(expanded_cmd, cmd, sizeof(cmd));
 
     char image[1024];
     bool have_image = win_image_path(cmd, image, sizeof(image));
@@ -2957,9 +3050,10 @@ static void win_scan_run_key(FindingList *fl, const Options *o, HKEY root,
             continue;
         }
 
-        char expanded[2048], image[1024];
+        char expanded[2048], normalized[2048], image[1024];
         win_expand_env(cmd, expanded, sizeof(expanded));
-        if (win_image_path(expanded, image, sizeof(image)) && is_writable_by_me(image)) {
+        win_normalize_image(expanded, normalized, sizeof(normalized));
+        if (win_image_path(normalized, image, sizeof(image)) && is_writable_by_me(image)) {
             if (o->is_root) {
                 add_finding(fl, "auto.run_target_writable_root_auditor", CAT_AUTOSTART,
                             SEV_INFO, CONF_CONFIRMED,
@@ -3147,11 +3241,16 @@ static void scan_filesystem(FindingList *fl, const Options *o) {
                                 "Writable PATH directory (elevated auditor)", expanded,
                                 "Writable by the identity running this audit; not an "
                                 "unprivileged escalation signal.");
-                } else if (path_in_user_profile(expanded) && nprofile < 32) {
-                    snprintf(profile_store[nprofile], sizeof(profile_store[0]),
-                             "%s", expanded);
-                    profile_dirs[nprofile] = profile_store[nprofile];
-                    nprofile++;
+                } else if (path_in_user_profile(expanded)) {
+                    bool dup = false;
+                    for (int k = 0; k < nprofile; k++)
+                        if (str_eq_ci(profile_dirs[k], expanded)) dup = true;
+                    if (!dup && nprofile < 32) {
+                        snprintf(profile_store[nprofile], sizeof(profile_store[0]),
+                                 "%s", expanded);
+                        profile_dirs[nprofile] = profile_store[nprofile];
+                        nprofile++;
+                    }
                 } else {
                     add_finding(fl, "fs.path_writable", CAT_FILESYSTEM, SEV_HIGH,
                                 CONF_CONFIRMED, "Writable directory in PATH", expanded,
@@ -3455,7 +3554,9 @@ static const BinHint *bin_hint_in_text(const char *text) {
     return NULL;
 }
 
-/* Copy the first 'single-quoted' field of a detail string (service names). */
+#ifdef _WIN32
+/* Copy the first 'single-quoted' field of a detail string (service names).
+ * Windows-only: it feeds the `sc qc` next step. */
 static bool first_quoted(const char *s, char *out, size_t outsz) {
     if (outsz) out[0] = '\0';
     const char *a = strchr(s, '\'');
@@ -3468,6 +3569,7 @@ static bool first_quoted(const char *s, char *out, size_t outsz) {
     out[n] = '\0';
     return true;
 }
+#endif /* _WIN32 */
 
 static const char *cap_advice(const char *cap) {
     static const struct { const char *cap; const char *advice; } table[] = {
@@ -3535,10 +3637,21 @@ static int suggest_actions(const Finding *f, char out[][ACTION_LEN], int max) {
         if (n < max)
             snprintf(out[n++], ACTION_LEN, "%s", cap_advice(id + 4));
     } else if (strncmp(id, "svc.", 4) == 0) {
+#ifdef _WIN32
         char name[256];
         if (first_quoted(f->detail, name, sizeof(name)) && n < max)
             snprintf(out[n++], ACTION_LEN,
                      "sc qc \"%s\"   # confirm the account and image it runs", name);
+#else
+        /* "sc qc" would be nonsense on Linux; point at the unit itself, and
+         * only when the finding's path really is a unit file. */
+        const char *unit = base_name(f->path);
+        size_t ulen = strlen(unit);
+        if (n < max && ulen > 8 && strcmp(unit + ulen - 8, ".service") == 0)
+            snprintf(out[n++], ACTION_LEN,
+                     "systemctl cat \"%s\"   # confirm ExecStart and the User= it runs as",
+                     unit);
+#endif
     } else if (strncmp(id, "auto.run", 8) == 0 && n < max) {
         snprintf(out[n++], ACTION_LEN,
                  "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\""
@@ -3941,13 +4054,17 @@ int main(int argc, char **argv) {
 #endif
 
     /* A category selected with --check that only exists on the other platform. */
-    for (int c = 0; c < CAT_COUNT; c++) {
+    for (int c = 0; o.selected != 0 && c < CAT_COUNT; c++) {
         if (!cat_selected(&o, (Category)c) || category_available((Category)c)) continue;
 #ifdef _WIN32
         const char *other = "Linux";
 #else
         const char *other = "Windows";
 #endif
+        /* INFO is hidden unless --verbose, so say it on stderr too: an empty
+         * report for a requested scan must never look like a clean result. */
+        fprintf(stderr, "%s: the '%s' scan is implemented in the %s build only\n",
+                TOOL_NAME, category_name((Category)c), other);
         add_finding(&fl, "platform.not_applicable", (Category)c, SEV_INFO, CONF_CONFIRMED,
                     "Scan not applicable on this platform", NULL,
                     "The '%s' scan is implemented in the %s build only.",

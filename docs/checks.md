@@ -84,8 +84,8 @@ runtime (see the notes under the tables).
 | `const char *check_id_user` | HIGH | CONFIRMED | linux | const char *title_user |
 | `cron.crontab_writable` | HIGH | CONFIRMED | linux | Writable /etc/crontab |
 | `cron.crontab_writable_root_auditor` | INFO | CONFIRMED | linux | Writable /etc/crontab (root auditor) |
-| `cron.unparsed_line` | LOW | POSSIBLE | linux | Unparsed cron line |
-| `cron.unparsed_token` | LOW | POSSIBLE | linux | Relative command in cron job |
+| `cron.unparsed_line` | INFO | CONFIRMED | linux | Unparsed cron line (not inspected) |
+| `cron.unparsed_token` | INFO | CONFIRMED | linux | Relative command in cron job (not inspected) |
 | `cron.writable_dir` | HIGH | CONFIRMED | linux | Writable cron directory |
 | `cron.writable_dir_root_auditor` | INFO | CONFIRMED | linux | Writable cron directory (root auditor) |
 | `cron.writable_file` | HIGH | CONFIRMED | linux | Writable cron job file |
@@ -99,7 +99,7 @@ runtime (see the notes under the tables).
 | -------- | -------- | ---------- | -------- | ----- |
 | `svc.enumerated` | INFO | CONFIRMED | windows | Services enumerated |
 | `svc.unavailable` | INFO | CONFIRMED | windows | Service scan unavailable |
-| `svc.unquoted_path` | MEDIUM / INFO | POSSIBLE | windows | Unquoted service path |
+| `svc.unquoted_path` | LOW / INFO | CONFIRMED | windows | Unquoted service path |
 | `svc.unquoted_path_root_auditor` | INFO | CONFIRMED | windows | Writable directory on unquoted service path (elevated auditor) |
 | `svc.unquoted_path_writable` | HIGH | CONFIRMED | windows | Unquoted service path with writable directory |
 | `svc.writable_dir` | HIGH / MEDIUM | LIKELY | windows | Service in writable directory |

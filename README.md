@@ -262,6 +262,13 @@ Expect them, especially at `POSSIBLE` confidence. Common causes:
   reported (`perm.unevaluated`) rather than counted as "not writable".
 - Kernel CVE matches ignore backports (see above). They are therefore capped
   at `MEDIUM`/`POSSIBLE`: a candidate to verify, never a `HIGH` verdict.
+- Cron text the parser cannot resolve to one command - a bare `run-parts`,
+  shell syntax, `@reboot` helpers - is recorded at `INFO`, because it describes
+  what was not inspected, not a misconfiguration. Stock Debian/Ubuntu crontabs
+  are full of those lines.
+- A Windows service with an unquoted path whose candidate directories are all
+  unwritable is `LOW`: the configuration is wrong, but there is no path to
+  exploit it from your account.
 
 Always confirm manually before acting on a finding.
 
@@ -412,8 +419,8 @@ the binary's version and on the exact sudo rule.
 ### Windows-specific
 
 - Unquoted service paths report every file name the loader would try before the
-  real image. A `MEDIUM`/`POSSIBLE` finding means "ambiguous path, no candidate
-  directory is writable by you"; `HIGH`/`CONFIRMED` means one is.
+  real image. A `LOW` finding means "ambiguous path, no candidate directory is
+  writable by you"; `HIGH`/`CONFIRMED` means one is.
 - Writable-service severity depends on the configured account: SYSTEM,
   LocalService and NetworkService count as privileged (CRITICAL for the image),
   any other account is HIGH/MEDIUM.

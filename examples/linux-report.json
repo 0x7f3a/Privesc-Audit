@@ -1,6 +1,6 @@
 {
   "tool": "privesc-auditor",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "host": {
     "platform": "linux",
     "elevated": false,

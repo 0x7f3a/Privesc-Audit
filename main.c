@@ -71,7 +71,7 @@
  * ==================================================================== */
 
 #define TOOL_NAME    "privesc-auditor"
-#define TOOL_VERSION "2.1.1"  /* 2.1.1: review fixes, see the false-positive notes */
+#define TOOL_VERSION "2.1.2"  /* 2.1.2: false-positive sweep (synthetic-host matrix) */
 
 #ifdef _WIN32
 #define TOOL_PLATFORM "windows"
@@ -307,12 +307,33 @@ static bool path_in_user_profile(const char *path) {
 #else
 static bool path_in_user_profile(const char *path) {
     const char *home = getenv("HOME");
-    if (!home || !*home) return false;
+    /* HOME="/" would make every absolute path look like part of the profile. */
+    if (!home || home[0] != '/' || home[1] == '\0') return false;
     size_t n = strlen(home);
     if (strncmp(path, home, n) != 0) return false;
     return path[n] == '\0' || path[n] == '/';
 }
 #endif
+
+/* Two spellings of the same directory: PATH entries often carry a trailing
+ * separator ("C:\\Python\\", "/home/x/bin/"), and treating those as different
+ * directories listed the same one twice. Root paths ("C:\\", "/") keep their
+ * separator. */
+static size_t dir_name_len(const char *s) {
+    size_t n = strlen(s);
+    while (n > 1 && (s[n - 1] == '/' || s[n - 1] == '\\')) n--;
+    return n;
+}
+
+static bool same_dir(const char *a, const char *b) {
+    size_t na = dir_name_len(a);
+    if (na != dir_name_len(b)) return false;
+#ifdef _WIN32
+    return _strnicmp(a, b, na) == 0;
+#else
+    return strncmp(a, b, na) == 0;
+#endif
+}
 
 static void report_profile_path_dirs(FindingList *fl, const char *const *dirs,
                                      int n, const char *var_label) {
@@ -1550,6 +1571,28 @@ static const char *cap_bit_name(int bit) {
     return names[bit];
 }
 
+/* Decode the permitted set from a raw security.capability value.
+ *
+ * Layout (little endian): magic+flags (4 bytes; the magic's top byte is the
+ * revision), then permitted/inheritable 32-bit words. Revision 1 carries only
+ * the low word; revisions 2 and 3 add the high word (and 3 a root id).
+ * Returns false when the blob is not a file capability at all. */
+static bool cap_decode(const unsigned char *buf, size_t n,
+                       unsigned long long *permitted) {
+    *permitted = 0;
+    if (!buf || n < 12) return false;
+    unsigned long revision = (unsigned)buf[3];
+    if (revision < 1 || revision > 3) return false;
+
+    *permitted = (unsigned long long)(buf[4] | (buf[5] << 8) | (buf[6] << 16) |
+                                      ((unsigned)buf[7] << 24));
+    if (revision >= 2 && n >= 20)
+        *permitted |= (unsigned long long)(buf[12] | (buf[13] << 8) |
+                                           (buf[14] << 16) | ((unsigned)buf[15] << 24))
+                      << 32;
+    return true;
+}
+
 typedef struct { FindingList *fl; int files; } CapCtx;
 
 static void cap_cb(const char *path, const struct stat *st, void *vctx) {
@@ -1557,24 +1600,10 @@ static void cap_cb(const char *path, const struct stat *st, void *vctx) {
     CapCtx *c = (CapCtx *)vctx;
     unsigned char buf[64];
     ssize_t n = getxattr(path, "security.capability", buf, sizeof(buf));
-    if (n < 12) return;
-
-    /* VFS cap data: magic+flags (4 bytes LE), then permitted/inheritable
-     * dwords per 32-bit block. We OR the permitted words for a bitset.
-     * The magic's top byte is the revision (1, 2 or 3); anything else is not
-     * a file capability and must not be decoded as one. */
-    unsigned long revision = (unsigned)buf[3];
-    if (revision < 1 || revision > 3) return;
+    if (n <= 0) return;
 
     unsigned long long permitted = 0;
-    if (n >= 12) {
-        permitted |= (unsigned long long)(buf[4] | (buf[5] << 8) |
-                     (buf[6] << 16) | ((unsigned)buf[7] << 24));
-    }
-    if (n >= 20) { /* v2: second 32-bit block of permitted at offset 12 */
-        permitted |= ((unsigned long long)(buf[12] | (buf[13] << 8) |
-                      (buf[14] << 16) | ((unsigned)buf[15] << 24))) << 32;
-    }
+    if (!cap_decode(buf, (size_t)n, &permitted)) return;
 
     c->files++;
 
@@ -1708,7 +1737,9 @@ static void inspect_sudo_line(FindingList *fl, const char *source, const char *s
                     "sudo !authenticate", source,
                     "Rule disables authentication: %.200s", s);
     }
-    if (strstr(s, "env_keep") &&
+    /* Only an addition is a risk: "env_keep -= LD_PRELOAD" removes the
+     * variable and is a hardening measure. */
+    if (strstr(s, "env_keep") && !strstr(s, "-=") &&
         (strstr(s, "LD_PRELOAD") || strstr(s, "LD_LIBRARY_PATH"))) {
         add_finding(fl, "sudo.env_keep_loader", CAT_SUDO, SEV_HIGH, CONF_LIKELY,
                     "Dangerous sudo env_keep", source,
@@ -1887,7 +1918,8 @@ static void scan_sudo(FindingList *fl, const Options *o, ScanStats *stats) {
  */
 
 static const char *cron_wrappers[] = {
-    "sudo", "env", "nohup", "nice", "ionice", "timeout", "xargs", "setsid", NULL
+    "sudo", "env", "nohup", "nice", "ionice", "timeout", "xargs", "setsid",
+    "flock", NULL
 };
 
 /* Shell control/test tokens that show up inside cron commands (e.g.
@@ -2006,14 +2038,14 @@ static void inspect_token_list(FindingList *fl, const Options *o, const char *fi
              * must be in command position and must not be a shell builtin. */
             if (job_context && command_position && !is_shell_builtin(tok)) {
                 if (cmd_user)
-                    add_finding(fl, "cron.unparsed_token", CAT_CRON, SEV_LOW, CONF_POSSIBLE,
-                                "Relative command in cron job", file,
+                    add_finding(fl, "cron.unparsed_token", CAT_CRON, SEV_INFO, CONF_CONFIRMED,
+                                "Relative command in cron job (not inspected)", file,
                                 "Token '%.100s' (job runs as %s) is relative or not a "
                                 "recognized wrapper; not inspected for writability.",
                                 tok, cmd_user);
                 else
-                    add_finding(fl, "cron.unparsed_token", CAT_CRON, SEV_LOW, CONF_POSSIBLE,
-                                "Relative command in cron job", file,
+                    add_finding(fl, "cron.unparsed_token", CAT_CRON, SEV_INFO, CONF_CONFIRMED,
+                                "Relative command in cron job (not inspected)", file,
                                 "Token '%.100s' is relative or not a recognized "
                                 "wrapper; not inspected for writability.", tok);
             }
@@ -2068,8 +2100,8 @@ static void inspect_cron_entry(FindingList *fl, const Options *o, const char *fi
         for (int i = 1; i < 5; i++) {
             tok = strtok_r(NULL, " \t", &save);
             if (!tok) {
-                add_finding(fl, "cron.unparsed_line", CAT_CRON, SEV_LOW, CONF_POSSIBLE,
-                            "Unparsed cron line", file,
+                add_finding(fl, "cron.unparsed_line", CAT_CRON, SEV_INFO, CONF_CONFIRMED,
+                            "Unparsed cron line (not inspected)", file,
                             "Line does not match the expected 5-field/@keyword "
                             "schedule format; left unparsed: %.150s", s);
                 return;
@@ -2306,8 +2338,15 @@ static void svc_cb(const char *path, const struct stat *st, void *vctx) {
             char *cmd = trim(eq + 1);
             while (*cmd == '-' || *cmd == '@' || *cmd == '+' || *cmd == '!')
                 cmd++; /* systemd exec prefixes */
-            char *sp = strpbrk(cmd, " \t");
-            if (sp) *sp = '\0';
+            if (*cmd == '"' || *cmd == '\'') {
+                /* Quoted executable: systemd allows ExecStart="/opt/a b/x". */
+                char quote = *cmd++;
+                char *endq = strchr(cmd, quote);
+                if (endq) *endq = '\0';
+            } else {
+                char *sp = strpbrk(cmd, " \t");
+                if (sp) *sp = '\0';
+            }
             if (cmd[0] == '/') {
                 struct stat bst;
                 if (stat(cmd, &bst) == 0 && S_ISREG(bst.st_mode) && is_writable_by_me(cmd)) {
@@ -2594,7 +2633,7 @@ static void scan_filesystem(FindingList *fl, const Options *o) {
                          * the profile rule says is not a boundary crossing. */
                         bool dup = false;
                         for (int k = 0; k < nprofile; k++)
-                            if (strcmp(profile_dirs[k], entry) == 0) dup = true;
+                            if (same_dir(profile_dirs[k], entry)) dup = true;
                         if (!dup && nprofile < 32) profile_dirs[nprofile++] = entry;
                     }
                     else
@@ -2886,7 +2925,7 @@ static void win_inspect_service(FindingList *fl, const Options *o, SC_HANDLE scm
 
         if (!hijackable) {
             add_finding(fl, "svc.unquoted_path", CAT_SERVICES,
-                        o->is_root ? SEV_INFO : SEV_MEDIUM, CONF_POSSIBLE,
+                        o->is_root ? SEV_INFO : SEV_LOW, CONF_CONFIRMED,
                         "Unquoted service path", shown,
                         "Service '%s' has an unquoted image path containing spaces. "
                         "No candidate directory is writable by the current user, but "
@@ -3244,7 +3283,7 @@ static void scan_filesystem(FindingList *fl, const Options *o) {
                 } else if (path_in_user_profile(expanded)) {
                     bool dup = false;
                     for (int k = 0; k < nprofile; k++)
-                        if (str_eq_ci(profile_dirs[k], expanded)) dup = true;
+                        if (same_dir(profile_dirs[k], expanded)) dup = true;
                     if (!dup && nprofile < 32) {
                         snprintf(profile_store[nprofile], sizeof(profile_store[0]),
                                  "%s", expanded);

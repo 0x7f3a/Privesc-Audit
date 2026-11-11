@@ -60,6 +60,18 @@ else
     head -10 "$TMP/unit-build.log" | sed 's/^/        /'
 fi
 
+if cc -std=c11 -Wall -Wextra -Wpedantic -Werror -O1 -o "$TMP/fp" tests/fp.c 2>"$TMP/fp-build.log"; then
+    if "$TMP/fp" >"$TMP/fp.txt" 2>&1; then
+        ok "false-positive matrix passes ($(grep -c '^  ok' "$TMP/fp.txt") cases)"
+    else
+        bad "false-positive matrix failed"
+        grep -A3 'FAIL' "$TMP/fp.txt" | head -24 | sed 's/^/        /'
+    fi
+else
+    bad "false-positive matrix build failed"
+    head -10 "$TMP/fp-build.log" | sed 's/^/        /'
+fi
+
 # ---------------------------------------------------------------- runs
 step "Runs"
 "$BIN" --verbose --no-color >"$TMP/report.txt" 2>"$TMP/report.err"

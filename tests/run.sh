@@ -426,6 +426,74 @@ else
     bad "unknown flag handling: rc=$? stdout=$(wc -c <"$TMP/bad.out") stderr=$(cat "$TMP/bad.err")"
 fi
 
+# ---------------------------------------------- root path (real uid 0)
+# The matrix can set Options.is_root, but only a real uid 0 proves the
+# downgrade logic against the kernel. An unprivileged user namespace maps the
+# test user to root without any privileges on the host.
+step "Root path: real uid 0 in an unprivileged user namespace"
+ROOT_NS=0
+if command -v unshare >/dev/null 2>&1 && unshare -Ur true 2>/dev/null; then
+    ROOT_NS=1
+fi
+if [ "$ROOT_NS" -eq 0 ]; then
+    if [ "${REQUIRE_ROOT_NS:-0}" = 1 ]; then
+        bad "unprivileged user namespaces are unavailable (REQUIRE_ROOT_NS=1)"
+    else
+        note "skipped: unshare -Ur is not permitted on this host"
+    fi
+else
+    mkdir -p "$TMP/root-planted"
+    PATH="$TMP/root-planted:/usr/bin:/bin" unshare -Ur "$BIN" --verbose --json \
+        >"$TMP/root.json" 2>"$TMP/root.err"
+    root_rc=$?
+    if python3 - "$TMP/root.json" "$root_rc" "$TMP/root-planted" <<'PY'
+import json, sys
+rep = json.load(open(sys.argv[1]))
+rc, planted = int(sys.argv[2]), sys.argv[3]
+errs = []
+host = rep.get("host", {})
+if host.get("uid") != 0:
+    errs.append("host.uid is %r inside the namespace, expected 0" % host.get("uid"))
+if host.get("elevated") is not True:
+    errs.append("host.elevated is %r for uid 0" % host.get("elevated"))
+severe = [f for f in rep["findings"] if f["severity"] in ("HIGH", "CRITICAL")]
+if severe:
+    errs.append("uid 0 run reported %d HIGH/CRITICAL finding(s): %s"
+                % (len(severe), ", ".join(f["check_id"] for f in severe[:3])))
+hits = [f for f in rep["findings"]
+        if f["check_id"] == "fs.path_writable_root_auditor" and f["path"] == planted]
+if len(hits) != 1:
+    errs.append("writable PATH dir not downgraded to INFO as uid 0 (%d hits)" % len(hits))
+elif hits[0]["severity"] != "INFO":
+    errs.append("downgraded finding is %s, expected INFO" % hits[0]["severity"])
+if not any(f["check_id"] == "sys.running_as_root" for f in rep["findings"]):
+    errs.append("sys.running_as_root is missing from the uid 0 run")
+noise = [f for f in rep["findings"]
+         if f["check_id"] in ("suid.nonroot_suid", "suid.sgid_nonroot")]
+if noise:
+    errs.append("uid 0 in a user namespace reports %d owner-mismatch finding(s), "
+                "e.g. %s" % (len(noise), noise[0]["path"]))
+if not any(f["check_id"] == "suid.userns_owner_unmapped" for f in rep["findings"]):
+    errs.append("missing suid.userns_owner_unmapped note")
+if rc > 1:
+    errs.append("exit code %d as uid 0, expected 0 or 1" % rc)
+if errs:
+    print("        " + "\n        ".join(errs))
+    sys.exit(1)
+PY
+    then
+        ok "real uid 0 downgrades writable-by-me findings to INFO (exit $root_rc)"
+    else
+        bad "the uid-0 run does not behave as documented"
+    fi
+    if [ -s "$TMP/root.err" ]; then
+        bad "the uid-0 run wrote to stderr"
+        head -3 "$TMP/root.err" | sed 's/^/        /'
+    else
+        ok "the uid-0 run is silent on stderr"
+    fi
+fi
+
 # ---------------------------------------------------------- sanitizers
 step "Sanitizers"
 if cc -std=c11 -Wall -Wextra -Wpedantic -g -O1 \

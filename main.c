@@ -1052,6 +1052,39 @@ static bool seen_set_check_add(SeenSet *s, dev_t dev, ino_t ino) {
 }
 #endif /* !_WIN32 */
 
+/* True when this process is "root" only inside an unprivileged user
+ * namespace: /proc/self/uid_map maps exactly one id, with inside id 0 backed
+ * by a non-zero outside uid (this is what `unshare -Ur`, rootless podman and
+ * similar sandboxes set up).
+ *
+ * It matters for ownership checks: real root is *outside* the namespace, so
+ * its files appear here as the overflow uid (65534, "nobody"). Reading that
+ * as "this SUID binary is not root-owned" produced a page of LOW findings on
+ * every namespace-rooted container. */
+#ifndef _WIN32
+static bool in_unprivileged_userns(void) {
+    static int cached = -1; /* -1 unknown, 0 no, 1 yes */
+    if (cached >= 0) return cached == 1;
+    cached = 0;
+
+    FILE *fp = fopen("/proc/self/uid_map", "r");
+    if (!fp) return false;
+
+    unsigned long in_start = 0, out_start = 0, count = 0;
+    int mappings = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "%lu %lu %lu", &in_start, &out_start, &count) == 3)
+            mappings++;
+    }
+    fclose(fp);
+
+    if (mappings == 1 && in_start == 0 && count == 1 && out_start != 0)
+        cached = 1;
+    return cached == 1;
+}
+#endif /* !_WIN32 */
+
 /* ========================================================================
  * Section 4: Scanners
  * ==================================================================== */
@@ -1433,7 +1466,12 @@ static void suid_cb(const char *path, const struct stat *st, void *vctx) {
     bool sgid = (st->st_mode & S_ISGID) != 0;
     if (!suid && !sgid) return;
 
-    bool root_owned = (st->st_uid == 0);
+    bool userns_root = in_unprivileged_userns();
+
+    /* Inside an unprivileged user namespace, host root is unmapped and shows
+     * up as the overflow uid; it is still root for ownership purposes. */
+    bool root_owned = (st->st_uid == 0) ||
+                      (userns_root && st->st_uid == (audit_id_t)65534);
     bool writable   = is_writable_by_me(path);
     bool baseline   = path_in(path, known_suid);
     bool dangerous  = basename_in(path, dangerous_suid);
@@ -1518,6 +1556,16 @@ static void suid_cb(const char *path, const struct stat *st, void *vctx) {
 }
 
 static void scan_suid(FindingList *fl, const Options *o, ScanStats *stats) {
+    if (in_unprivileged_userns())
+        add_finding(fl, "suid.userns_owner_unmapped", CAT_SUID, SEV_INFO,
+                    CONF_CONFIRMED, "Running inside an unprivileged user namespace",
+                    NULL,
+                    "uid 0 here is mapped from an unprivileged host uid, so files "
+                    "owned by real root appear as uid 65534. Such files are treated "
+                    "as root-owned rather than as non-root-owned binaries; a file "
+                    "genuinely owned by 'nobody' is indistinguishable from inside "
+                    "this namespace.");
+
     static const char *roots[] = {
         "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin",
         "/usr/local/sbin", "/usr/lib", "/opt", NULL

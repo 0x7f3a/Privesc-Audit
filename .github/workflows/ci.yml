@@ -1,0 +1,56 @@
+# Build and test the auditor on every push and pull request.
+#
+# The suite is self-contained (tests/run.sh): it builds with -Wall -Wextra
+# -Wpedantic -Werror, runs the tool against the runner and checks the findings
+# against ground truth, runs the synthetic-host false-positive matrix, and
+# exercises both the text and the JSON writers under ASan/UBSan.
+#
+# REQUIRE_ROOT_NS=1 makes the uid-0 check mandatory here. The runner provides
+# an unprivileged user namespace, so the root path is exercised with a real
+# kernel identity instead of being silently skipped.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: make test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          cc --version | head -n 1
+          python3 --version
+          unshare --version
+
+      - name: Allow unprivileged user namespaces
+        # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor,
+        # which would block the uid-0 test. This is an ephemeral runner, so the
+        # restriction is lifted for the job and verified immediately.
+        run: |
+          current=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)
+          if [ "$current" = "1" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare -Ur sh -c 'echo "uid inside the namespace: $(id -u)"'
+
+      - name: make test
+        env:
+          REQUIRE_ROOT_NS: "1"
+        run: make test

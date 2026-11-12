@@ -11,7 +11,7 @@ checks are compiled only into that build, `both` into either. Severity and
 confidence are what the code passes at the call site; a few checks vary at
 runtime (see the notes under the tables).
 
-**113 check ids.**
+**114 check ids.**
 
 ### `system` (3)
 
@@ -21,7 +21,7 @@ runtime (see the notes under the tables).
 | `sys.running_as_root` | INFO | CONFIRMED | linux | Running as root |
 | `sys.running_elevated` | INFO | CONFIRMED | windows | Running elevated |
 
-### `suid` (10)
+### `suid` (11)
 
 | Check ID | Severity | Confidence | Platform | Title |
 | -------- | -------- | ---------- | -------- | ----- |
@@ -32,6 +32,7 @@ runtime (see the notes under the tables).
 | `suid.sgid_baseline` | INFO | CONFIRMED | linux | Standard SGID binary |
 | `suid.sgid_nonroot` | LOW | POSSIBLE | linux | Non-root-owned SGID binary |
 | `suid.sgid_root` | MEDIUM | POSSIBLE | linux | Root-owned SGID binary |
+| `suid.userns_owner_unmapped` | INFO | CONFIRMED | linux | Running inside an unprivileged user namespace |
 | `suid.writable_nonroot_owned` | HIGH | CONFIRMED | linux | Writable non-root-owned privileged binary |
 | `suid.writable_root_auditor` | INFO | CONFIRMED | linux | Writable privileged binary (root auditor) |
 | `suid.writable_root_owned` | CRITICAL | CONFIRMED | linux | Writable root-owned binary |

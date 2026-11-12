@@ -192,11 +192,36 @@ and checks the result rather than a fixture:
 - the SUID/SGID set the tool reports equals the one `find(1)` finds over the
   same scan roots (compared by real path, so usr-merged `/bin` vs `/usr/bin`
   does not matter);
-- `--check` runs only the selected category;
-- an ASan/UBSan run is clean;
+- `--check` runs only the selected category, and end-to-end behaviour holds: a
+  writable `PATH` directory outside `$HOME` is `HIGH` *and* exit code 2, a
+  directory containing a space survives into the report, `HOME` unset or set to
+  `/` does not misclassify the profile, and repeated runs are byte-identical;
+- helper unit tests (Windows image-path parsing, sudo rule parsing, capability
+  decoding, next-step selection, JSON escaping);
+- a synthetic-host false-positive matrix (63 cases): stock or benign
+  configurations - PATH layouts, crontabs, sudoers rules, systemd units,
+  SUID/SGID states, capability blobs - must produce nothing above `INFO`;
+- an ASan/UBSan run of both the text and the JSON writers;
 - `docs/checks.md` is in sync with `main.c` and covers every id the run emitted.
 
+Inside an unprivileged user namespace (rootless containers, `unshare -Ur`)
+real root is unmapped and its files appear as uid 65534; those files are
+treated as root-owned, with a `suid.userns_owner_unmapped` INFO note, so a
+namespace-rooted run does not report every stock SUID binary as non-root.
+
+The uid-0 path is exercised for real, not simulated: `unshare -Ur` maps the
+test user to root in a new user namespace, and the suite asserts that
+writable-by-me findings become `INFO` and the exit code stays in 0..1. Set
+`REQUIRE_ROOT_NS=1` to turn an unavailable namespace into a failure instead of
+a skip; CI sets it, so the root path cannot silently go untested.
+
 It needs `cc` and `python3` and writes nothing outside a temporary directory.
+
+CI runs `make test` on every push and pull request
+([.github/workflows/ci.yml](.github/workflows/ci.yml)). Ubuntu 24.04 runners
+restrict unprivileged user namespaces through AppArmor, so the workflow lifts
+that restriction for the job (`kernel.apparmor_restrict_unprivileged_userns=0`)
+and verifies the namespace works before running the suite.
 
 ## Severity levels
 

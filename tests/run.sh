@@ -136,6 +136,75 @@ else
     bad "--verbose JSON lost the not-applicable note"
 fi
 
+# End-to-end Linux behaviour: a writable PATH directory outside $HOME is a real
+# HIGH and must drive exit code 2, not merely appear in a listing.
+mkdir -p "$TMP/planted"
+PATH="$TMP/planted:/usr/bin:/bin" "$BIN" --json >"$TMP/planted.json" 2>/dev/null
+planted_rc=$?
+if python3 - "$TMP/planted.json" "$TMP/planted" "$planted_rc" <<'PY'
+import json, sys
+rep = json.load(open(sys.argv[1]))
+path, rc = sys.argv[2], int(sys.argv[3])
+hits = [f for f in rep["findings"]
+        if f["check_id"] == "fs.path_writable" and f["path"] == path]
+errs = []
+if len(hits) != 1:
+    errs.append("expected one fs.path_writable for %s, got %d" % (path, len(hits)))
+elif hits[0]["severity"] != "HIGH":
+    errs.append("severity is %s, expected HIGH" % hits[0]["severity"])
+if rc != 2:
+    errs.append("exit code %d, expected 2 for a HIGH finding" % rc)
+if errs:
+    print("        " + "\n        ".join(errs))
+    sys.exit(1)
+PY
+then
+    ok "a writable PATH directory outside HOME is HIGH and exits 2"
+else
+    bad "end-to-end HIGH path is wrong (see above)"
+fi
+
+# A directory whose name contains a space must survive the round trip.
+mkdir -p "$TMP/with space"
+PATH="$TMP/with space:/usr/bin:/bin" "$BIN" --verbose --json >"$TMP/space.json" 2>/dev/null
+if grep -q "with space" "$TMP/space.json"; then
+    ok "a PATH directory containing a space is reported intact"
+else
+    bad "a PATH directory containing a space was mangled"
+fi
+
+# Two identical runs must produce identical reports.
+"$BIN" --verbose --no-color >"$TMP/det1.txt" 2>/dev/null
+"$BIN" --verbose --no-color >"$TMP/det2.txt" 2>/dev/null
+if cmp -s "$TMP/det1.txt" "$TMP/det2.txt"; then
+    ok "repeated runs are byte-identical"
+else
+    bad "output is not deterministic between runs"
+fi
+
+# HOME=/ must not make every absolute PATH entry look like the own profile.
+env HOME=/ "$BIN" --json --verbose >"$TMP/home-root.json" 2>/dev/null
+if grep -q 'fs.path_writable_user_profile' "$TMP/home-root.json"; then
+    bad "HOME=/ produced a bogus profile aggregation"
+else
+    ok "HOME=/ does not swallow every absolute PATH entry"
+fi
+
+# An empty report is still valid JSON with total 0 and an empty array.
+"$BIN" --check system --json >"$TMP/empty.json" 2>/dev/null
+if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["summary"]["total"] == 0 and d["findings"] == [] else 1)' "$TMP/empty.json"; then
+    ok "a run with nothing to report is valid JSON (total 0, empty array)"
+else
+    bad "empty report is not valid JSON as expected"
+fi
+
+"$BIN" --check no-such-category >/dev/null 2>&1
+if [ $? -eq 2 ]; then
+    ok "--check with an unknown category exits 2"
+else
+    bad "--check with an unknown category did not exit 2"
+fi
+
 # Calibration: a writable directory inside the account's own profile must not
 # be reported HIGH, and must be summarised under a single LOW finding.
 python3 - "$TMP/report.json" <<'PY' && ok "PATH severity is calibrated to ownership" \
@@ -313,13 +382,16 @@ if cc -std=c11 -Wall -Wextra -Wpedantic -g -O1 \
        -o "$TMP/privesc-auditor.san" "$SRC" 2>"$TMP/san-build.log"; then
     "$TMP/privesc-auditor.san" --verbose --no-color >"$TMP/san.txt" 2>"$TMP/san.err"
     san_rc=$?
+    "$TMP/privesc-auditor.san" --verbose --json >"$TMP/san.json" 2>>"$TMP/san.err"
+    san_json_rc=$?
+    if [ "$san_json_rc" -gt 3 ] && [ "$san_rc" -le 3 ]; then san_rc=$san_json_rc; fi
     if [ -s "$TMP/san.err" ] && grep -qE 'AddressSanitizer|runtime error:|LeakSanitizer' "$TMP/san.err"; then
         bad "ASan/UBSan reported problems"
         grep -E 'AddressSanitizer|runtime error:|LeakSanitizer' "$TMP/san.err" | head -5 | sed 's/^/        /'
     elif [ "$san_rc" -gt 3 ]; then
         bad "sanitizer build exited $san_rc"
     else
-        ok "ASan/UBSan run is clean (exit $san_rc)"
+        ok "ASan/UBSan run is clean, text and JSON (exit $san_rc)"
     fi
 else
     bad "sanitizer build failed"

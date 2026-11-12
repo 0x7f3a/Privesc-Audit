@@ -57,6 +57,16 @@ static void expect_none(const char *what) {
     failures++;
 }
 
+static void expect_within(const char *what, Severity ceiling) {
+    if (worst() <= ceiling) {
+        printf("  ok    %s\n", what);
+        return;
+    }
+    printf("  FAIL  %s: expected nothing above %s\n", what, severity_name(ceiling));
+    dump(what);
+    failures++;
+}
+
 static void expect_one(const char *id, Severity sev, const char *what) {
     if (fl.count >= 1 && (size_t)count_id(id) == fl.count &&
         fl.items[0].severity == sev) {
@@ -533,6 +543,50 @@ int main(void) {
         }
 
         if (copy[0]) setenv("HOME", copy, 1);
+    }
+
+    /* ------------------------------------------------- root auditor */
+    printf("\nroot auditor\n");
+    {
+        Options root_opt;
+        memset(&root_opt, 0, sizeof root_opt);
+        root_opt.is_root = true;
+
+        char value[2048];
+        snprintf(value, sizeof value, "/usr/bin:%s", outside);
+        setenv("PATH", value, 1);
+        reset();
+        scan_filesystem(&fl, &root_opt);
+        expect_within("writable PATH directories are INFO for a root auditor", SEV_INFO);
+
+        char line[1024];
+        snprintf(line, sizeof line, "0 1 * * * root %s", wp);
+        reset();
+        inspect_cron_entry(&fl, &root_opt, "/etc/crontab", true, line);
+        expect_within("a writable cron target is INFO for a root auditor", SEV_INFO);
+
+        SvcCtx rctx = { &fl, &root_opt };
+        struct stat st;
+        reset();
+        if (stat(unit, &st) == 0) svc_cb(unit, &st, &rctx);
+        expect_within("a writable ExecStart is INFO for a root auditor", SEV_INFO);
+
+        memset(&st, 0, sizeof st);
+        st.st_uid = 0;
+        st.st_mode = S_IFREG | S_ISUID | S_IXUSR | S_IRUSR | S_IWUSR;
+        SuidCtx rsuid = { &fl, &root_opt };
+        reset();
+        suid_cb(wp, &st, &rsuid);
+        expect_within("root's own write access to a SUID binary is INFO, not CRITICAL",
+                      SEV_INFO);
+
+        /* The condition did not change, only who is looking: for a normal user
+         * the same binary is the top severity. */
+        SuidCtx usuid = { &fl, &opt };
+        reset();
+        suid_cb(wp, &st, &usuid);
+        expect_one("suid.writable_root_owned", SEV_CRITICAL,
+                   "the same writable root-owned SUID binary is CRITICAL for a user");
     }
 
     chmod(unit_dir, 0755);

@@ -307,9 +307,20 @@ static bool path_in_user_profile(const char *path) {
 #else
 static bool path_in_user_profile(const char *path) {
     const char *home = getenv("HOME");
-    /* HOME="/" would make every absolute path look like part of the profile. */
+    char fallback[1024];
+    /* HOME can be unset (cron, systemd, `env -i`) or damaged, and HOME="/"
+     * would make every absolute path look like part of the profile. The
+     * password database is the authoritative home directory for this uid. */
+    if (!home || home[0] != '/' || home[1] == '\0') {
+        struct passwd *pw = getpwuid(getuid());
+        if (pw && pw->pw_dir && pw->pw_dir[0] == '/' && pw->pw_dir[1] != '\0') {
+            snprintf(fallback, sizeof fallback, "%s", pw->pw_dir);
+            home = fallback;
+        }
+    }
     if (!home || home[0] != '/' || home[1] == '\0') return false;
     size_t n = strlen(home);
+    while (n > 1 && home[n - 1] == '/') n--;
     if (strncmp(path, home, n) != 0) return false;
     return path[n] == '\0' || path[n] == '/';
 }
@@ -2650,6 +2661,13 @@ static void scan_filesystem(FindingList *fl, const Options *o) {
         }
 
         report_profile_path_dirs(fl, profile_dirs, nprofile, "$PATH");
+    } else {
+        /* Silence here read as "PATH is clean"; it only means PATH is absent. */
+        add_finding(fl, "fs.path_unset", CAT_FILESYSTEM, SEV_INFO, CONF_CONFIRMED,
+                    "$PATH is not set", NULL,
+                    "No PATH in the environment, so PATH dirs, ordering and "
+                    "writability were not analysed. Cron jobs and services often "
+                    "run with a minimal environment like this.");
     }
 
     /* 4.7c Sensitive files that should never be writable/readable. */
@@ -3226,7 +3244,14 @@ static void scan_autostart(FindingList *fl, const Options *o) {
 
 static void scan_filesystem(FindingList *fl, const Options *o) {
     const char *path_env = getenv("PATH");
-    if (!path_env || !*path_env) return;
+    if (!path_env || !*path_env) {
+        /* Report the skip instead of looking like a clean PATH. */
+        add_finding(fl, "fs.path_unset", CAT_FILESYSTEM, SEV_INFO, CONF_CONFIRMED,
+                    "PATH is not set", NULL,
+                    "No PATH in the environment, so PATH dirs, ordering and "
+                    "writability were not analysed.");
+        return;
+    }
 
     char copy[8192];
     size_t plen = strlen(path_env);

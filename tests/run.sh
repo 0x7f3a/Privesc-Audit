@@ -182,12 +182,63 @@ else
     bad "output is not deterministic between runs"
 fi
 
-# HOME=/ must not make every absolute PATH entry look like the own profile.
-env HOME=/ "$BIN" --json --verbose >"$TMP/home-root.json" 2>/dev/null
-if grep -q 'fs.path_writable_user_profile' "$TMP/home-root.json"; then
-    bad "HOME=/ produced a bogus profile aggregation"
+# HOME=/ must not turn the account's own tools into system directories: the
+# passwd home is used instead, so any own-profile directory stays LOW.
+env HOME=/ "$BIN" --json >"$TMP/home-root.json" 2>/dev/null
+home_root_rc=$?
+if python3 - "$TMP/home-root.json" "$home_root_rc" <<'PY'
+import json, os, pwd, sys
+rep = json.load(open(sys.argv[1]))
+rc = int(sys.argv[2])
+home = pwd.getpwuid(os.getuid()).pw_dir.rstrip("/")
+errs = []
+for f in rep["findings"]:
+    p = f.get("path", "")
+    if f["check_id"] == "fs.path_writable" and home and (
+            p == home or p.startswith(home + "/")):
+        errs.append("own-profile directory rated HIGH with HOME=/: %s" % p)
+if rc > 1:
+    errs.append("exit code %d with HOME=/, expected 0 or 1" % rc)
+if errs:
+    print("        " + "\n        ".join(errs))
+    sys.exit(1)
+PY
+then
+    ok "HOME=/ falls back to the passwd home instead of misrating it"
 else
-    ok "HOME=/ does not swallow every absolute PATH entry"
+    bad "HOME=/ misclassified an own-profile directory"
+fi
+
+# With HOME unset the profile must still be known (via the passwd entry), or
+# the account's own tools turn into a HIGH and exit code 2.
+env -u HOME "$BIN" --json >"$TMP/nohome.json" 2>/dev/null
+nohome_rc=$?
+if python3 - "$TMP/nohome.json" "$nohome_rc" <<'PY'
+import json, sys
+rep = json.load(open(sys.argv[1]))
+rc = int(sys.argv[2])
+errs = []
+for f in rep["findings"]:
+    if f["check_id"] == "fs.path_writable":
+        errs.append("fs.path_writable rated HIGH with HOME unset: %s" % f["path"])
+if rc > 1:
+    errs.append("exit code %d with HOME unset, expected 0 or 1" % rc)
+if errs:
+    print("        " + "\n        ".join(errs))
+    sys.exit(1)
+PY
+then
+    ok "an unset HOME does not turn own-profile directories into HIGH"
+else
+    bad "an unset HOME misclassified a writable PATH directory"
+fi
+
+# An unset PATH must be stated, not silently skipped.
+env -u PATH "$BIN" --verbose --json >"$TMP/nopath.json" 2>/dev/null
+if python3 -c 'import json,sys; ids={f["check_id"] for f in json.load(open(sys.argv[1]))["findings"]}; sys.exit(0 if "fs.path_unset" in ids else 1)' "$TMP/nopath.json"; then
+    ok "an unset PATH is reported instead of skipped silently"
+else
+    bad "an unset PATH produced no note"
 fi
 
 # An empty report is still valid JSON with total 0 and an empty array.

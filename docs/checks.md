@@ -11,7 +11,7 @@ checks are compiled only into that build, `both` into either. Severity and
 confidence are what the code passes at the call site; a few checks vary at
 runtime (see the notes under the tables).
 
-**111 check ids.**
+**113 check ids.**
 
 ### `system` (3)
 
@@ -123,7 +123,7 @@ runtime (see the notes under the tables).
 | `proc.writable_exe` | HIGH | LIKELY | linux | Root process with writable binary |
 | `proc.writable_exe_root_auditor` | INFO | CONFIRMED | linux | Root process writable by root (auditor) |
 
-### `filesystem` (17)
+### `filesystem` (19)
 
 | Check ID | Severity | Confidence | Platform | Title |
 | -------- | -------- | ---------- | -------- | ----- |
@@ -134,6 +134,8 @@ runtime (see the notes under the tables).
 | `fs.path_overlong` | LOW | CONFIRMED | windows | Overlong PATH value |
 | `fs.path_relative` | MEDIUM | LIKELY | linux | Relative entry in $PATH |
 | `fs.path_relative` | MEDIUM | LIKELY | windows | Relative entry in PATH |
+| `fs.path_unset` | INFO | CONFIRMED | linux | $PATH is not set |
+| `fs.path_unset` | INFO | CONFIRMED | windows | PATH is not set |
 | `fs.path_writable` | HIGH | CONFIRMED | linux | Writable directory in $PATH |
 | `fs.path_writable` | HIGH | CONFIRMED | windows | Writable directory in PATH |
 | `fs.path_writable_root_auditor` | INFO | CONFIRMED | linux | Writable $PATH directory (root auditor) |

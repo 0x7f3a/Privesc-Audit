@@ -211,6 +211,11 @@ int main(void) {
         rmdir(home_bin);
     }
 
+    unsetenv("PATH");
+    reset();
+    scan_filesystem(&fl, &opt);
+    expect_one("fs.path_unset", SEV_INFO, "an unset PATH is a coverage note, not silence");
+
     setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
     reset();
     scan_filesystem(&fl, &opt);
@@ -534,11 +539,24 @@ int main(void) {
             failures++;
         }
 
+        /* With HOME unset the password database still knows the home
+         * directory; not using it turned the account's own tools into a HIGH. */
+        struct passwd *pw = getpwuid(getuid());
         unsetenv("HOME");
-        if (!path_in_user_profile("/home/x/bin"))
-            printf("  ok    an unset HOME matches nothing\n");
+        if (pw && pw->pw_dir) {
+            char inside[512];
+            snprintf(inside, sizeof inside, "%s/pafp-inside", pw->pw_dir);
+            if (path_in_user_profile(inside))
+                printf("  ok    an unset HOME falls back to the passwd home directory\n");
+            else {
+                printf("  FAIL  an unset HOME lost the profile match\n");
+                failures++;
+            }
+        }
+        if (!path_in_user_profile("/usr/bin"))
+            printf("  ok    an unset HOME still does not match system paths\n");
         else {
-            printf("  FAIL  unset HOME still matched\n");
+            printf("  FAIL  an unset HOME matched /usr/bin\n");
             failures++;
         }
 
